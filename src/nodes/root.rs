@@ -719,12 +719,15 @@ impl ComponentRoot {
         };
 
         if let Some(precise_span) = word_span.subspan(word_content, start_offset, end_offset) {
-            if context.first_pos.is_none()
-                || precise_span.start.byte < context.first_pos.unwrap().byte
+            if context
+                .first_pos
+                .is_none_or(|pos| precise_span.start.byte < pos.byte)
             {
                 *context.first_pos = Some(precise_span.start);
             }
-            if context.last_pos.is_none() || precise_span.end.byte > context.last_pos.unwrap().byte
+            if context
+                .last_pos
+                .is_none_or(|pos| precise_span.end.byte > pos.byte)
             {
                 *context.last_pos = Some(precise_span.end);
             }
