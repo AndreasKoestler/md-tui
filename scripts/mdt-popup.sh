@@ -39,11 +39,9 @@ abs_file=$(cd -- "$(dirname -- "$file")" && pwd)/$(basename -- "$file")
 dump=$(mktemp -t mdt-dump.XXXXXX)
 trap 'rm -f -- "$dump"' EXIT
 
-# Inline env var + %q-quoted args: tmux server scrubs the environment, so
-# MDT_DUMP_PATH has to live inside the shell-command string itself.
-cmd=$(printf 'MDT_DUMP_PATH=%q mdt %q' "$dump" "$abs_file")
-[[ -n $username ]] && cmd+=$(printf ' -u %q' "$username")
+# shellcheck source=lib/mdt-popup-lib.sh
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/mdt-popup-lib.sh"
 
-tmux popup -E -w 90% -h 90% "$cmd"
+run_mdt_popup "$abs_file" "$dump" "$username"
 
 [[ -s $dump ]] && cat -- "$dump"

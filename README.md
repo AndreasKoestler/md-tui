@@ -224,6 +224,10 @@ This application also exists as a plugin for Neovim called
 >
 > This version does not support images regardless of your terminal capabilities.
 
+## Claude Code integration
+
+- **Claude Code review hook** — review markdown Claude Code writes in md-tui's comment mode and have your comments fed back to Claude. See [`docs/mdt-review-hook.md`](docs/mdt-review-hook.md).
+
 ## Contributions
 
 Both PRs and issues are appreciated!
