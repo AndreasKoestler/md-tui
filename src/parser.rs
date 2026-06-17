@@ -89,11 +89,6 @@ impl SourceSpan {
         Self { start, end }
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.start.byte == self.end.byte
-    }
-
     fn from_pest_span(span: pest::Span<'_>) -> Self {
         let start = span.start_pos();
         let end = span.end_pos();
@@ -118,6 +113,20 @@ impl SourceSpan {
         let end = start.advance(slice);
 
         Some(Self { start, end })
+    }
+
+    /// Sub-span of `take_len` bytes beginning where `suffix` starts within
+    /// `original` — i.e. at byte offset `original.len() - suffix.len()`.
+    /// `suffix` must be a trailing slice of `original`. Returns `None` if the
+    /// resulting range isn't on char boundaries of `original`.
+    pub(crate) fn subspan_of_suffix(
+        self,
+        original: &str,
+        suffix: &str,
+        take_len: usize,
+    ) -> Option<Self> {
+        let offset = original.len().saturating_sub(suffix.len());
+        self.subspan(original, offset, offset + take_len)
     }
 }
 
@@ -255,20 +264,6 @@ fn node_word(node: &ParseNode, content: String, word_type: WordType) -> Word {
     word_with_source_span(content, word_type, node.source_span())
 }
 
-fn node_word_slice(
-    node: &ParseNode,
-    content: String,
-    word_type: WordType,
-    start_offset: usize,
-    end_offset: usize,
-) -> Word {
-    let source_span = node
-        .source_span()
-        .and_then(|span| span.subspan(node.content(), start_offset, end_offset));
-
-    word_with_source_span(content, word_type, source_span)
-}
-
 fn push_leaf_word(
     words: &mut Vec<Word>,
     node: &ParseNode,
@@ -283,7 +278,11 @@ fn push_leaf_word(
 
     if split_leading_space && content.starts_with(' ') {
         content.remove(0);
-        words.push(node_word_slice(node, " ".to_owned(), word_type, 0, 1));
+        // The stripped leading space is the first source byte.
+        let space_span = node
+            .source_span()
+            .and_then(|span| span.subspan(node.content(), 0, 1));
+        words.push(word_with_source_span(" ".to_owned(), word_type, space_span));
 
         // `content` is the (possibly space-deduplicated) display text with its
         // leading space stripped. Because a leaf word is `WHITESPACE_S* ~ p_char+`,
@@ -292,10 +291,9 @@ fn push_leaf_word(
         // source span byte-aligned with the displayed text regardless of how much
         // leading whitespace was collapsed, so comment/selection anchoring stays
         // correct (see `resolve_selection_on_word`).
-        let offset = node.content().len().saturating_sub(content.len());
         let source_span = node
             .source_span()
-            .and_then(|span| span.subspan(node.content(), offset, node.content().len()));
+            .and_then(|span| span.subspan_of_suffix(node.content(), &content, content.len()));
         words.push(word_with_source_span(content, word_type, source_span));
     } else {
         words.push(node_word(node, content, word_type));

@@ -379,12 +379,12 @@ impl TextComponent {
     }
 
     fn links_iter(&self) -> impl Iterator<Item = &Word> {
-        self.meta_info.iter().filter(|c| {
-            matches!(
-                c.kind(),
-                WordType::LinkData | WordType::FootnoteInline | WordType::Link
-            )
-        })
+        // Links live in `meta_info` as `LinkData`; `FootnoteInline` is the
+        // footnote equivalent. `WordType::Link` words are renderable and only
+        // ever appear in `content`, so they are intentionally not matched here.
+        self.meta_info
+            .iter()
+            .filter(|c| matches!(c.kind(), WordType::LinkData | WordType::FootnoteInline))
     }
 
     pub fn highlight_link(&self) -> Result<&str, String> {
@@ -483,9 +483,8 @@ fn trim_word_leading_space(word: &mut Word) {
     // the new span can refer back into it.
     let content = word.content().to_owned();
     let trimmed = content.trim_start();
-    let offset = content.len() - trimmed.len();
     if let Some(span) = word.source_span() {
-        let new_span = span.subspan(&content, offset, content.len());
+        let new_span = span.subspan_of_suffix(&content, trimmed, trimmed.len());
         *word = Word::new_with_source_span(trimmed.to_owned(), word.kind(), new_span);
     } else {
         word.set_content(trimmed.to_owned());
@@ -542,18 +541,19 @@ fn split_and_wrap_long_word(
     wrap_remaining_tail(word, tail, &mut context);
 }
 
+/// One column is reserved for a trailing hyphen when a word will be split and
+/// hyphenated (i.e. hyphenation is on and it doesn't already end in `-`).
+fn hyphen_reserve(content: &str, enable_hyphen: bool) -> usize {
+    usize::from(enable_hyphen && !content.ends_with('-'))
+}
+
 fn split_word_initial_part(
     content: &str,
     width: usize,
     current_line_len: usize,
     enable_hyphen: bool,
 ) -> (String, String) {
-    let split_width = if enable_hyphen && !content.ends_with('-') {
-        width - current_line_len - 1
-    } else {
-        width - current_line_len
-    };
-
+    let split_width = width - current_line_len - hyphen_reserve(content, enable_hyphen);
     split_by_width(content, split_width)
 }
 
@@ -579,11 +579,7 @@ fn process_tail_chunk(word: &Word, tail: String, context: &mut WrapContext) -> S
 }
 
 fn split_and_hyphenate_tail(tail: &str, context: &WrapContext) -> (String, String, bool) {
-    let split_width = if context.enable_hyphen && !tail.ends_with('-') {
-        context.width - 1
-    } else {
-        context.width
-    };
+    let split_width = context.width - hyphen_reserve(tail, context.enable_hyphen);
 
     let (mut inner_head, next_tail) = split_by_width(tail, split_width);
     let mut hyphenated = false;
@@ -611,8 +607,11 @@ fn create_head_word(
         inner_head.to_owned(),
         word.kind(),
         word.source_span().and_then(|s| {
-            let offset = context.original_content.len() - current_tail_content.len();
-            s.subspan(context.original_content, offset, offset + inner_head.len())
+            s.subspan_of_suffix(
+                context.original_content,
+                current_tail_content,
+                inner_head.len(),
+            )
         }),
     )
 }
@@ -623,16 +622,12 @@ fn finalize_tail(word: &Word, tail: String, context: &mut WrapContext) {
         *context.current_line = Vec::new();
     } else {
         let current_tail_content = tail.clone();
+        let tail_len = current_tail_content.len();
         let tail_word = Word::new_with_source_span(
             tail,
             word.kind(),
             word.source_span().and_then(|s| {
-                let offset = context.original_content.len() - current_tail_content.len();
-                s.subspan(
-                    context.original_content,
-                    offset,
-                    context.original_content.len(),
-                )
+                s.subspan_of_suffix(context.original_content, &current_tail_content, tail_len)
             }),
         );
         *context.current_line_len = display_width(tail_word.content());
@@ -786,43 +781,56 @@ fn transform_codeblock(component: &mut TextComponent) {
     ));
 }
 
-fn process_highlighted_code(content: &str, events: Vec<HighlightEvent>) -> Vec<Vec<Word>> {
+/// Flatten highlight events into colored words, returning the trailing color
+/// (the highlight state after the last event) for the closing blank word.
+fn highlight_events_to_words(content: &str, events: Vec<HighlightEvent>) -> (Vec<Word>, Color) {
     let mut color = Color::Reset;
     let mut words = Vec::new();
-
     for event in events {
         match event {
-            HighlightEvent::Source { start, end } => {
-                words.push(Word::new(
-                    content[start..end].to_string(),
-                    WordType::CodeBlock(color),
-                ));
-            }
+            HighlightEvent::Source { start, end } => words.push(Word::new(
+                content[start..end].to_string(),
+                WordType::CodeBlock(color),
+            )),
             HighlightEvent::HighlightStart(index) => color = COLOR_MAP[index.0],
             HighlightEvent::HighlightEnd => color = Color::Reset,
         }
     }
+    (words, color)
+}
+
+/// Append `word` to the current line, splitting on embedded newlines: each
+/// `\n` flushes `inner` into `final_content` as a completed line, leaving the
+/// trailing fragment in `inner`.
+fn push_word_split_on_newlines(
+    word: Word,
+    inner: &mut Vec<Word>,
+    final_content: &mut Vec<Vec<Word>>,
+) {
+    if !word.content().contains('\n') {
+        inner.push(word);
+        return;
+    }
+    let mut start = 0;
+    for (i, c) in word.content().char_indices() {
+        if c == '\n' {
+            inner.push(Word::new(word.content()[start..i].to_string(), word.kind()));
+            start = i + c.len_utf8();
+            final_content.push(std::mem::take(inner));
+        }
+    }
+    if start < word.content().len() {
+        inner.push(Word::new(word.content()[start..].to_string(), word.kind()));
+    }
+}
+
+fn process_highlighted_code(content: &str, events: Vec<HighlightEvent>) -> Vec<Vec<Word>> {
+    let (words, color) = highlight_events_to_words(content, events);
 
     let mut final_content = Vec::new();
     let mut inner_content = Vec::new();
-
     for word in words {
-        if word.content().contains('\n') {
-            let mut start = 0;
-            for (i, c) in word.content().char_indices() {
-                if c == '\n' {
-                    let new_word = Word::new(word.content()[start..i].to_string(), word.kind());
-                    inner_content.push(new_word);
-                    start = i + c.len_utf8();
-                    final_content.push(std::mem::take(&mut inner_content));
-                }
-            }
-            if start < word.content().len() {
-                inner_content.push(Word::new(word.content()[start..].to_string(), word.kind()));
-            }
-        } else {
-            inner_content.push(word);
-        }
+        push_word_split_on_newlines(word, &mut inner_content, &mut final_content);
     }
 
     if !inner_content.is_empty() {
@@ -1220,5 +1228,146 @@ mod tests {
             end: content.len(),
         }];
         assert_eq!(lines(content, events), vec!["", "    x", ""]);
+    }
+
+    // --- split_by_width / byte_offset_at_width ----------------------------
+
+    #[test]
+    fn split_by_width_breaks_at_display_width() {
+        assert_eq!(
+            split_by_width("hello", 3),
+            ("hel".to_owned(), "lo".to_owned())
+        );
+        // Exact fit takes the whole string.
+        assert_eq!(split_by_width("hi", 2), ("hi".to_owned(), String::new()));
+        // Zero width splits nothing off the head.
+        assert_eq!(split_by_width("hi", 0), (String::new(), "hi".to_owned()));
+        // A wide (CJK, width 2) char is not split mid-character.
+        assert_eq!(
+            split_by_width("世界", 3),
+            ("世".to_owned(), "界".to_owned())
+        );
+    }
+
+    #[test]
+    fn byte_offset_and_entry_len_account_for_wide_chars() {
+        // "世" is display width 2 / byte length 3.
+        assert_eq!(byte_offset_at_width("世界", 2), 3);
+        assert_eq!(byte_offset_at_width("世界", 1), 0);
+        assert_eq!(
+            content_entry_len(&[
+                Word::new("ab".to_owned(), WordType::Normal),
+                Word::new("世".to_owned(), WordType::Normal),
+            ]),
+            4
+        );
+    }
+
+    // --- word_wrapping (covers split_and_wrap_long_word) ------------------
+
+    fn wrap_text(words: &[Word], width: usize) -> Vec<String> {
+        word_wrapping(words, width, false)
+            .iter()
+            .map(|line| line.iter().map(Word::content).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn word_wrapping_keeps_words_on_one_line_when_they_fit() {
+        let words = vec![
+            Word::new("hello".to_owned(), WordType::Normal),
+            Word::new("world".to_owned(), WordType::Normal),
+        ];
+        assert_eq!(wrap_text(&words, 20), vec!["helloworld"]);
+    }
+
+    #[test]
+    fn word_wrapping_wraps_at_width_boundary() {
+        let words = vec![
+            Word::new("hello".to_owned(), WordType::Normal),
+            Word::new("world".to_owned(), WordType::Normal),
+        ];
+        assert_eq!(wrap_text(&words, 5), vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn word_wrapping_splits_a_single_overlong_word() {
+        let words = vec![Word::new("abcdefghij".to_owned(), WordType::Normal)];
+        let lines = wrap_text(&words, 5);
+        assert_eq!(lines, vec!["abcde", "fghij"]);
+        // Nothing is lost in the split.
+        assert_eq!(lines.concat(), "abcdefghij");
+    }
+
+    // --- selected_heights -------------------------------------------------
+
+    #[test]
+    fn selected_heights_reports_rows_with_a_selection() {
+        let comp = TextComponent::new_formatted(
+            TextNode::Paragraph,
+            vec![
+                vec![Word::new("a".to_owned(), WordType::Normal)],
+                vec![Word::new("b".to_owned(), WordType::Selected)],
+                vec![Word::new("c".to_owned(), WordType::Normal)],
+            ],
+        );
+        assert_eq!(comp.selected_heights(), vec![1]);
+    }
+
+    #[test]
+    fn selected_heights_is_empty_when_hidden() {
+        let mut comp = TextComponent::new_formatted(
+            TextNode::Paragraph,
+            vec![vec![Word::new("b".to_owned(), WordType::Selected)]],
+        );
+        comp.set_hidden(true);
+        assert!(comp.selected_heights().is_empty());
+    }
+
+    // --- calculate_balanced_column_widths ---------------------------------
+
+    #[test]
+    fn balanced_widths_passthrough_when_no_column_overflows() {
+        // threshold = 100/2 = 50; neither column exceeds it.
+        assert_eq!(
+            calculate_balanced_column_widths(&[2, 3], 100, 0),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn balanced_widths_shrink_the_overflowing_column() {
+        // threshold = 50/2 = 25; col1 (90) overflows, col0 (10) does not.
+        // available_balanced = 50 - 10 = 40; ratio 1.0 -> col1 becomes 40.
+        assert_eq!(
+            calculate_balanced_column_widths(&[10, 90], 50, 0),
+            vec![10, 40]
+        );
+    }
+
+    // --- list / table transform via the parser (ListTransformer, tables) --
+
+    fn rendered_text(md: &str) -> String {
+        crate::parser::parse_markdown(None, md, 80)
+            .components()
+            .iter()
+            .flat_map(|c| c.content_as_lines())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn list_transform_renders_all_items() {
+        let text = rendered_text("- alpha\n- beta\n");
+        assert!(text.contains("alpha"), "got: {text:?}");
+        assert!(text.contains("beta"), "got: {text:?}");
+    }
+
+    #[test]
+    fn table_transform_renders_all_cells() {
+        let text = rendered_text("| head | col |\n|------|-----|\n| one | two |\n");
+        for cell in ["head", "col", "one", "two"] {
+            assert!(text.contains(cell), "missing {cell} in: {text:?}");
+        }
     }
 }

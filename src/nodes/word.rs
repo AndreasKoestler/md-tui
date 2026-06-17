@@ -112,11 +112,6 @@ impl Word {
     }
 
     #[must_use]
-    pub fn new_source(content: String, word_type: WordType, source_span: SourceSpan) -> Self {
-        Self::new_with_source_span(content, word_type, Some(source_span))
-    }
-
-    #[must_use]
     pub fn new_with_source_span(
         content: String,
         word_type: WordType,
@@ -231,7 +226,7 @@ mod tests {
     #[test]
     fn source_backed_words_store_source_span() {
         let span = source_span();
-        let word = Word::new_source("hello".to_string(), WordType::Bold, span);
+        let word = Word::new_with_source_span("hello".to_string(), WordType::Bold, Some(span));
 
         assert_eq!(word.source_span(), Some(span));
     }

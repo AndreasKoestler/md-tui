@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use md_tui::bookmarks::BookmarkStore;
+use md_tui::bookmarks;
 use md_tui::event_handler::{KeyBoardAction, handle_keyboard_input};
 use md_tui::nodes::image::ImageComponent;
 use md_tui::nodes::root::{Component, ComponentRoot};
@@ -143,7 +143,13 @@ fn dump_comments(dump_inputs: md_tui::sidemark::DumpInputs<'_>, target: DumpTarg
                 eprintln!("warning: failed to write MDT_DUMP_PATH: {e}");
             }
         }
-        DumpTarget::Stdout => md_tui::sidemark::dump_to_stdout(dump_inputs),
+        // Stdout must be written AFTER the alternate screen is torn down,
+        // otherwise the YAML lands in the alt buffer and vanishes on restore.
+        DumpTarget::Stdout => {
+            if let Some(yaml) = md_tui::sidemark::render(dump_inputs) {
+                print!("{yaml}");
+            }
+        }
     }
 }
 
@@ -228,7 +234,7 @@ impl AppEnvironment {
                 app.raw_source = Some(file);
                 app.mode = Mode::View;
                 app.help_box.set_mode(Mode::View);
-                let (marks, w) = BookmarkStore::load_for(path);
+                let (marks, w) = bookmarks::load_for(path);
                 app.bookmarks = marks;
                 app.bookmark_origin_width = w;
             } else {
@@ -281,7 +287,7 @@ fn run_app(
         env.markdown.set_scroll(app.vertical_scroll);
 
         terminal.draw(|f| {
-            render_main_ui(f, app, &mut env.markdown, &mut file_tree, &f_rx, height);
+            render_main_ui(f, app, &mut env.markdown, &mut file_tree, &f_rx);
             render_overlays(f, app, height);
         })?;
 
@@ -365,7 +371,6 @@ fn render_main_ui(
     markdown: &mut ComponentRoot,
     file_tree: &mut FileTree,
     f_rx: &mpsc::Receiver<Option<MdFile>>,
-    _height: u16,
 ) {
     match app.mode {
         Mode::View => {
@@ -388,6 +393,18 @@ fn render_main_ui(
     }
 }
 
+/// A `(width, height)` box centered horizontally on `app_width` and vertically
+/// at `term_height / 2`. `saturating_sub` avoids an underflow panic when the
+/// box is wider than the terminal.
+fn centered(app_width: u16, term_height: u16, width: u16, height: u16) -> Rect {
+    Rect {
+        x: app_width.saturating_sub(width) / 2,
+        y: term_height / 2,
+        width,
+        height,
+    }
+}
+
 fn render_overlays(f: &mut Frame, app: &App, height: u16) {
     match app.boxes {
         Boxes::Search => {
@@ -402,26 +419,15 @@ fn render_overlays(f: &mut Frame, app: &App, height: u16) {
         }
         Boxes::Error => {
             let (error_height, error_width) = app.message_box.dimensions();
-            let error_area = Rect {
-                x: app.width() / 2 - error_width / 2,
-                y: height / 2,
-                width: error_width,
-                height: error_height,
-            };
             if app.width() > error_width {
+                let error_area = centered(app.width(), height, error_width, error_height);
                 f.render_widget(Clear, error_area);
                 f.render_widget(app.message_box.clone(), error_area);
             }
         }
         Boxes::LinkPreview => {
             let (link_height, link_width) = app.link_box.dimensions();
-            let link_area = Rect {
-                // Center horizontally on the terminal width, not its height.
-                x: app.width().saturating_sub(link_width) / 2,
-                y: height / 2,
-                width: link_width,
-                height: link_height,
-            };
+            let link_area = centered(app.width(), height, link_width, link_height);
             f.render_widget(Clear, link_area);
             f.render_widget(app.link_box.clone(), link_area);
         }
@@ -564,6 +570,86 @@ fn render_caret(f: &mut Frame, app: &App, area: &Rect) {
     }
 }
 
+/// Translate the current `Editing` comment state into an `EditingDraft`, or
+/// `None` when no draft is being edited.
+fn editing_draft<'a>(
+    app: &'a App,
+    markdown: &ComponentRoot,
+) -> Option<md_tui::boxes::comment_sidebar::EditingDraft<'a>> {
+    use md_tui::comments::{CommentState, EditTarget};
+    match &app.comment_state {
+        CommentState::Editing {
+            range,
+            draft,
+            cursor,
+            target,
+            ..
+        } => Some(md_tui::boxes::comment_sidebar::EditingDraft {
+            range: *range,
+            source: markdown.resolve_selection_to_source(range.0, range.1),
+            draft,
+            cursor: *cursor,
+            replaces_saved_idx: match target {
+                EditTarget::Existing(i) => Some(*i),
+                EditTarget::New => None,
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// Where the `i`-th comment's card sits in the sidebar. Prefers the projected
+/// render position; an empty projection means the source span no longer maps
+/// onto the view, so fall back to the comment's original source line so the
+/// orphaned card stays near where it was instead of jumping to the top.
+fn card_anchor(app: &App, i: usize, comment: &md_tui::comments::Comment) -> md_tui::util::Caret {
+    app.comment_projections
+        .get(i)
+        .and_then(|p| p.rendered.first().map(|r| r.start))
+        .unwrap_or(md_tui::util::Caret {
+            line: u16::try_from(comment.source.start.line.saturating_sub(1)).unwrap_or(u16::MAX),
+            col: 0,
+        })
+}
+
+/// Build the sidebar cards: every saved comment (skipping the one being
+/// edited, which is shown as the draft) followed by the draft card, if any.
+fn build_comment_boxes<'a>(
+    app: &'a App,
+    draft: &'a Option<md_tui::boxes::comment_sidebar::EditingDraft<'a>>,
+) -> Vec<md_tui::boxes::comment_sidebar::CommentBox<'a>> {
+    use md_tui::boxes::comment_sidebar::{CommentBox, CommentBoxState};
+
+    let replaced_idx = draft.as_ref().and_then(|d| d.replaces_saved_idx);
+    let mut boxes = Vec::new();
+
+    for (i, c) in app.comments.iter().enumerate() {
+        if Some(i) == replaced_idx {
+            continue;
+        }
+        let state = if app.active_comment == Some(i) && draft.is_none() {
+            CommentBoxState::Active(c)
+        } else {
+            CommentBoxState::Inactive(c)
+        };
+        boxes.push(CommentBox {
+            state,
+            anchor: card_anchor(app, i, c),
+            header: app.username.as_deref(),
+        });
+    }
+
+    if let Some(d) = draft {
+        boxes.push(CommentBox {
+            state: CommentBoxState::Editing(d),
+            anchor: d.range.0,
+            header: app.username.as_deref(),
+        });
+    }
+
+    boxes
+}
+
 fn render_comment_sidebar_ui(
     f: &mut Frame,
     app: &App,
@@ -571,10 +657,7 @@ fn render_comment_sidebar_ui(
     area: &Rect,
     size: Rect,
 ) {
-    use md_tui::boxes::comment_sidebar::{
-        CommentBox, CommentBoxState, CommentSideBar, EditingDraft, SIDEBAR_WIDTH,
-    };
-    use md_tui::comments::CommentState;
+    use md_tui::boxes::comment_sidebar::{CommentSideBar, SIDEBAR_WIDTH};
 
     let sb_x = area.x + area.width;
     let sb_w = SIDEBAR_WIDTH.min(size.width.saturating_sub(sb_x));
@@ -589,71 +672,9 @@ fn render_comment_sidebar_ui(
         height: area.height,
     };
 
-    let editing_draft = match &app.comment_state {
-        CommentState::Editing {
-            range,
-            draft,
-            cursor,
-            target,
-            ..
-        } => Some(EditingDraft {
-            range: *range,
-            source: markdown.resolve_selection_to_source(range.0, range.1),
-            draft,
-            cursor: *cursor,
-            replaces_saved_idx: match target {
-                md_tui::comments::EditTarget::Existing(i) => Some(*i),
-                md_tui::comments::EditTarget::New => None,
-            },
-        }),
-        _ => None,
-    };
-
-    let replaced_idx = editing_draft.as_ref().and_then(|d| d.replaces_saved_idx);
-    let mut boxes = Vec::new();
-
-    // Add saved comments
-    for (i, c) in app.comments.iter().enumerate() {
-        if Some(i) == replaced_idx {
-            continue;
-        }
-        // An empty `rendered` means the comment's source span no longer
-        // projects onto the current view (it also gets no main-pane highlight).
-        // Fall back to its original source line so the orphaned card stays near
-        // where it was rather than jumping to the very top of the sidebar.
-        let anchor = app
-            .comment_projections
-            .get(i)
-            .and_then(|p| p.rendered.first().map(|r| r.start))
-            .unwrap_or(md_tui::util::Caret {
-                line: u16::try_from(c.source.start.line.saturating_sub(1)).unwrap_or(u16::MAX),
-                col: 0,
-            });
-
-        let state = if app.active_comment == Some(i) && editing_draft.is_none() {
-            CommentBoxState::Active(c)
-        } else {
-            CommentBoxState::Inactive(c)
-        };
-
-        boxes.push(CommentBox {
-            state,
-            anchor,
-            header: app.username.as_deref(),
-        });
-    }
-
-    // Add draft
-    if let Some(draft) = &editing_draft {
-        boxes.push(CommentBox {
-            state: CommentBoxState::Editing(draft),
-            anchor: draft.range.0,
-            header: app.username.as_deref(),
-        });
-    }
-
+    let draft = editing_draft(app, markdown);
     let sidebar = CommentSideBar {
-        boxes,
+        boxes: build_comment_boxes(app, &draft),
         markdown_scroll: app.vertical_scroll,
     };
 
@@ -667,38 +688,26 @@ fn render_help_menu_ui(f: &mut Frame, app: &App, area: &Rect, size: Rect) {
     let footer_h: u16 = if GENERAL_CONFIG.footer { 1 } else { 0 };
 
     let block = Block::default().bg(Color::Black);
-    let (block_area, help_area) = if app.help_box.expanded() {
-        (
-            Rect {
-                y: size.height.saturating_sub(HELP_BLOCK_HEIGHT + 1 + footer_h),
-                height: cmp::min(HELP_BLOCK_HEIGHT, size.height),
-                x: area.x,
-                width: area.width - 1,
-            },
-            Rect {
-                x: area.x + 2,
-                y: size
-                    .height
-                    .saturating_sub(HELP_CONTENT_HEIGHT + 2 + footer_h),
-                height: cmp::min(HELP_CONTENT_HEIGHT, size.height),
-                width: app.width() - 5,
-            },
-        )
+
+    // Per-state sizing. `block_h`/`content_basis` drive the bottom-anchored
+    // y offsets; `content_h` is the content box's own height. (Collapsed keeps
+    // a 3-row content box positioned as if 1 row — preserved verbatim.)
+    let (block_h, content_basis, content_h) = if app.help_box.expanded() {
+        (HELP_BLOCK_HEIGHT, HELP_CONTENT_HEIGHT, HELP_CONTENT_HEIGHT)
     } else {
-        (
-            Rect {
-                y: size.height.saturating_sub(4 + footer_h),
-                height: cmp::min(3, size.height),
-                x: area.x,
-                width: area.width - 1,
-            },
-            Rect {
-                x: area.x + 2,
-                y: size.height.saturating_sub(3 + footer_h),
-                height: cmp::min(3, size.height),
-                width: app.width() - 5,
-            },
-        )
+        (3, 1, 3)
+    };
+    let block_area = Rect {
+        x: area.x,
+        y: size.height.saturating_sub(block_h + 1 + footer_h),
+        width: area.width - 1,
+        height: cmp::min(block_h, size.height),
+    };
+    let help_area = Rect {
+        x: area.x + 2,
+        y: size.height.saturating_sub(content_basis + 2 + footer_h),
+        width: app.width() - 5,
+        height: cmp::min(content_h, size.height),
     };
 
     f.render_widget(Clear, block_area);

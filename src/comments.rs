@@ -13,13 +13,22 @@ pub struct ProjectedCommentAnchor {
     pub rendered: Vec<RenderedRange>,
 }
 
+impl ProjectedCommentAnchor {
+    /// The anchor's full rendered extent as a `(start, end)` caret pair — the
+    /// start of its first rendered range to the end of its last. `None` when
+    /// the anchor projects to nothing (off-screen / orphaned span).
+    #[must_use]
+    pub fn full_range(&self) -> Option<(Caret, Caret)> {
+        Some((self.rendered.first()?.start, self.rendered.last()?.end))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {
     pub source: SourceSpan,
     pub text: String,
-    /// Snapshot of the markdown text covered by `source` at the time the
-    /// comment was saved. Stored so the on-exit Sidemark dump can fill the
-    /// `selected_text` field even if the source file has changed since.
+    /// The markdown text covered by `source`, captured at save time, so the
+    /// on-exit Sidemark dump can report what the comment was attached to.
     pub selected_text: Option<String>,
 }
 
@@ -41,9 +50,8 @@ pub enum CommentState {
     Editing {
         range: (Caret, Caret),
         draft: String,
-        /// Position of the insertion caret in `draft`. For this iteration the
-        /// editor assumes ASCII input, so this is both the byte offset and
-        /// the character count. Multi-byte support is out of scope here.
+        /// Byte offset of the insertion caret in `draft`, always kept on a
+        /// `char` boundary (it only ever moves by whole `char`s).
         cursor: usize,
         /// Whether this edit will create a new comment or update an existing
         /// one in place.

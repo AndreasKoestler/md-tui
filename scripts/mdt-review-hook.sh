@@ -14,6 +14,10 @@ glob_match() {
     local file=$1 root=${2%/}
     shift 2
     local g f rc=1
+    # Save the prior globstar/nullglob state and restore it exactly, so sourcing
+    # this function never silently flips a caller's shell options off.
+    local prior_opts
+    prior_opts=$(shopt -p globstar nullglob)
     shopt -s globstar nullglob
     for g in "$@"; do
         for f in "$root"/$g; do
@@ -23,7 +27,7 @@ glob_match() {
             fi
         done
     done
-    shopt -u globstar nullglob
+    eval "$prior_opts"
     return $rc
 }
 
@@ -57,11 +61,15 @@ format_reason() {
     [[ -s $dump ]] || return 0
 
     local rows
+    # Fields are joined with a literal TAB, so any TAB inside a scalar would
+    # scramble the columns — squash them to spaces on capture. (Sidemark emits
+    # tabs as the `\t` escape inside double-quoted scalars, so this is belt-and-
+    # braces against a stray literal tab.)
     rows=$(awk '
         /^  - id:/             { if (have) print line "\t" text "\t" sel; have=1; line=""; text=""; sel="" }
         /^    line: /          { line=$2 }
-        /^    text: /          { text=substr($0, index($0, ": ") + 2) }
-        /^    selected_text: / { sel=substr($0, index($0, ": ") + 2) }
+        /^    text: /          { text=substr($0, index($0, ": ") + 2); gsub(/\t/, " ", text) }
+        /^    selected_text: / { sel=substr($0, index($0, ": ") + 2); gsub(/\t/, " ", sel) }
         END                    { if (have) print line "\t" text "\t" sel }
     ' "$dump")
     [[ -n $rows ]] || return 0

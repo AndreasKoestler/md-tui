@@ -37,6 +37,9 @@ impl<'a> TextBox<'a> {
     }
 
     /// Calculate the height required to render the text within a given width.
+    ///
+    /// This mirrors the character-wrapping rule in `render` (including the
+    /// extra row a trailing cursor wraps onto) and must be kept in sync with it.
     pub fn calculate_height(text: &str, width: u16, has_cursor: bool) -> u16 {
         if width == 0 {
             return 1;
@@ -66,19 +69,12 @@ impl<'a> Widget for TextBox<'a> {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        fill_area(buf, area, self.style);
+        draw_text(buf, area, self.text, self.style);
 
-        let mut renderer = WrappingRenderer::new(area, buf, self.style);
-        renderer.pre_fill();
-
-        for ch in self.text.chars() {
-            renderer.check_cursor(self.cursor);
-            if !renderer.render_char(ch) {
-                break;
-            }
-        }
-
-        renderer.finalize_cursor(self.cursor);
-        if let Some((cx, cy)) = renderer.cursor_xy
+        if let Some((cx, cy)) = self
+            .cursor
+            .and_then(|c| wrapped_cursor_xy(self.text, area, c))
             && let Some(cell) = buf.cell_mut((cx, cy))
         {
             cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -86,85 +82,87 @@ impl<'a> Widget for TextBox<'a> {
     }
 }
 
-/// Internal helper for character-level wrapping.
-struct WrappingRenderer<'a> {
-    area: Rect,
-    buf: &'a mut Buffer,
-    style: Style,
-    line: u16,
-    col: u16,
-    byte_idx: usize,
-    cursor_xy: Option<(u16, u16)>,
+/// Fill `area` with spaces styled as `style` (the box background).
+fn fill_area(buf: &mut Buffer, area: Rect, style: Style) {
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(" ");
+                cell.set_style(style);
+            }
+        }
+    }
 }
 
-impl<'a> WrappingRenderer<'a> {
-    fn new(area: Rect, buf: &'a mut Buffer, style: Style) -> Self {
-        Self {
-            area,
-            buf,
-            style,
-            line: 0,
-            col: 0,
-            byte_idx: 0,
-            cursor_xy: None,
+/// Advance the wrapping pen `(line, col)` past one char. Returns the cell to
+/// draw a printable char at (`None` for a newline), and `stop = true` once the
+/// area is exhausted (the caller should stop). `(line, col)` end up *after* the
+/// char. Shared by `draw_text` and `wrapped_cursor_xy` so they wrap identically.
+fn advance(line: &mut u16, col: &mut u16, ch: char, area: Rect) -> (Option<(u16, u16)>, bool) {
+    if ch == '\n' {
+        *line += 1;
+        *col = 0;
+        return (None, *line >= area.height);
+    }
+    if *col >= area.width {
+        *line += 1;
+        *col = 0;
+    }
+    if *line >= area.height {
+        return (None, true);
+    }
+    let cell = (area.x + *col, area.y + *line);
+    *col += 1;
+    (Some(cell), false)
+}
+
+/// Draw `text` into `area` with character-level wrapping (no word wrap).
+fn draw_text(buf: &mut Buffer, area: Rect, text: &str, style: Style) {
+    let (mut line, mut col) = (0u16, 0u16);
+    let mut tmp = [0u8; 4];
+    for ch in text.chars() {
+        let (cell, stop) = advance(&mut line, &mut col, ch, area);
+        if let Some((x, y)) = cell
+            && let Some(c) = buf.cell_mut((x, y))
+        {
+            c.set_symbol(ch.encode_utf8(&mut tmp));
+            c.set_style(style);
+        }
+        if stop {
+            break;
         }
     }
+}
 
-    fn pre_fill(&mut self) {
-        for y in self.area.y..self.area.y + self.area.height {
-            for x in self.area.x..self.area.x + self.area.width {
-                if let Some(cell) = self.buf.cell_mut((x, y)) {
-                    cell.set_symbol(" ");
-                    cell.set_style(self.style);
-                }
-            }
+/// Cell where the cursor at byte offset `cursor` lands under the same wrapping
+/// as `draw_text`, or `None` if it falls outside `area`. A cursor at the very
+/// end of the text wraps onto the next row when the last line is full (matching
+/// `calculate_height`).
+fn wrapped_cursor_xy(text: &str, area: Rect, cursor: usize) -> Option<(u16, u16)> {
+    let (mut line, mut col) = (0u16, 0u16);
+    // Checked before the char at that offset is placed, so it lands on the cell.
+    for (byte_idx, ch) in text.char_indices() {
+        if byte_idx == cursor {
+            return Some((area.x + col, area.y + line));
+        }
+        if advance(&mut line, &mut col, ch, area).1 {
+            break;
         }
     }
+    end_cursor_xy(area, line, col, cursor == text.len())
+}
 
-    fn check_cursor(&mut self, cursor: Option<usize>) {
-        if cursor == Some(self.byte_idx) && self.cursor_xy.is_none() {
-            self.cursor_xy = Some((self.area.x + self.col, self.area.y + self.line));
-        }
+/// Cursor cell for an offset at the very end of the text: wraps onto the next
+/// row if the last line is full. `None` if not at the end or off-area.
+fn end_cursor_xy(area: Rect, mut line: u16, mut col: u16, at_end: bool) -> Option<(u16, u16)> {
+    if !at_end {
+        return None;
     }
-
-    fn next_line(&mut self) -> bool {
-        self.line += 1;
-        self.col = 0;
-        self.line < self.area.height
+    if col >= area.width {
+        line += 1;
+        col = 0;
     }
-
-    fn render_char(&mut self, ch: char) -> bool {
-        if ch == '\n' {
-            self.byte_idx += ch.len_utf8();
-            return self.next_line();
-        }
-
-        if self.col >= self.area.width && !self.next_line() {
-            return false;
-        }
-
-        let mut buf_str = [0u8; 4];
-        let x = self.area.x + self.col;
-        let y = self.area.y + self.line;
-        if let Some(cell) = self.buf.cell_mut((x, y)) {
-            cell.set_symbol(ch.encode_utf8(&mut buf_str));
-            cell.set_style(self.style);
-        }
-        self.col += 1;
-        self.byte_idx += ch.len_utf8();
-        true
-    }
-
-    fn finalize_cursor(&mut self, cursor: Option<usize>) {
-        if cursor == Some(self.byte_idx) && self.cursor_xy.is_none() {
-            if self.col >= self.area.width {
-                let _ = self.next_line();
-            }
-            if self.line < self.area.height {
-                self.cursor_xy = Some((self.area.x + self.col, self.area.y + self.line));
-            }
-        }
-    }
+    (line < area.height).then_some((area.x + col, area.y + line))
 }
 
 #[cfg(test)]

@@ -100,6 +100,25 @@ impl Default for SearchBox {
     }
 }
 
+impl Widget for SearchBox {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default().borders(Borders::BOTTOM);
+        let inner = block.inner(area);
+        block.render(area, buf);
+        // `self.cursor` counts characters, but `TextBox` matches the cursor
+        // against a byte index — convert so the caret renders in the right
+        // place after multi-byte input (e.g. "é").
+        let byte_cursor = self
+            .text
+            .char_indices()
+            .nth(self.cursor)
+            .map_or_else(|| self.text.len(), |(i, _)| i);
+        TextBox::new(&self.text)
+            .cursor(byte_cursor)
+            .render(inner, buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,16 +138,5 @@ mod tests {
         // Deleting past the start is a no-op.
         sb.delete();
         assert_eq!(sb.cursor, 0);
-    }
-}
-
-impl Widget for SearchBox {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default().borders(Borders::BOTTOM);
-        let inner = block.inner(area);
-        block.render(area, buf);
-        TextBox::new(&self.text)
-            .cursor(self.cursor)
-            .render(inner, buf);
     }
 }

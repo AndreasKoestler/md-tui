@@ -59,39 +59,53 @@ pub fn render(inputs: DumpInputs<'_>) -> Option<String> {
     out.push_str(&format!("document: {}\n", yaml_quoted(document)));
     out.push_str("comments:\n");
     for c in inputs.comments {
-        let id = uuid::Uuid::new_v4();
-        let (start_line, start_col) = position_for(inputs.raw_source, c.source.start);
-        let (raw_end_line, raw_end_col) = position_for(inputs.raw_source, c.source.end);
-        // The internal SourceSpan end is half-open (one past the last
-        // selected byte). Sidemark's `end_line` is inclusive, so when our
-        // half-open end sits at column 1 of a later line — i.e., the
-        // selection ended exactly at a newline — pull it back to the last
-        // column of the previous line.
-        let (end_line, end_col) = if raw_end_col == 1 && raw_end_line > start_line {
-            let prev_line_chars = inputs
-                .raw_source
-                .map_or(0, |raw| line_char_count(raw, raw_end_line - 1));
-            (raw_end_line - 1, prev_line_chars + 1)
-        } else {
-            (raw_end_line, raw_end_col)
-        };
-        out.push_str(&format!("  - id: {id}\n"));
-        out.push_str(&format!("    author: {}\n", yaml_quoted(author)));
-        out.push_str(&format!("    timestamp: '{timestamp}'\n"));
-        out.push_str(&format!("    text: {}\n", yaml_quoted(&c.text)));
-        out.push_str("    resolved: false\n");
-        out.push_str(&format!("    line: {start_line}\n"));
-        out.push_str(&format!("    end_line: {end_line}\n"));
-        out.push_str(&format!(
-            "    start_column: {}\n",
-            start_col.saturating_sub(1)
-        ));
-        out.push_str(&format!("    end_column: {}\n", end_col.saturating_sub(1)));
-        if let Some(sel) = &c.selected_text {
-            out.push_str(&format!("    selected_text: {}\n", yaml_quoted(sel)));
-        }
+        emit_comment(&mut out, c, author, &timestamp, inputs.raw_source);
     }
     Some(out)
+}
+
+/// Convert a comment's half-open source span ends into Sidemark's inclusive
+/// `(end_line, end_col)`. The internal `SourceSpan` end is half-open (one past
+/// the last selected byte); when it sits at column 1 of a later line — i.e. the
+/// selection ended exactly at a newline — pull it back to the last column of
+/// the previous line.
+fn inclusive_end(
+    raw: Option<&str>,
+    start_line: u32,
+    raw_end_line: u32,
+    raw_end_col: u32,
+) -> (u32, u32) {
+    if raw_end_col == 1 && raw_end_line > start_line {
+        let prev_line_chars = raw.map_or(0, |raw| line_char_count(raw, raw_end_line - 1));
+        (raw_end_line - 1, prev_line_chars + 1)
+    } else {
+        (raw_end_line, raw_end_col)
+    }
+}
+
+/// Append one comment's YAML block to `out`. Columns are emitted 0-based per
+/// the spec.
+fn emit_comment(out: &mut String, c: &Comment, author: &str, timestamp: &str, raw: Option<&str>) {
+    let id = uuid::Uuid::new_v4();
+    let (start_line, start_col) = position_for(raw, c.source.start);
+    let (raw_end_line, raw_end_col) = position_for(raw, c.source.end);
+    let (end_line, end_col) = inclusive_end(raw, start_line, raw_end_line, raw_end_col);
+
+    out.push_str(&format!("  - id: {id}\n"));
+    out.push_str(&format!("    author: {}\n", yaml_quoted(author)));
+    out.push_str(&format!("    timestamp: '{timestamp}'\n"));
+    out.push_str(&format!("    text: {}\n", yaml_quoted(&c.text)));
+    out.push_str("    resolved: false\n");
+    out.push_str(&format!("    line: {start_line}\n"));
+    out.push_str(&format!("    end_line: {end_line}\n"));
+    out.push_str(&format!(
+        "    start_column: {}\n",
+        start_col.saturating_sub(1)
+    ));
+    out.push_str(&format!("    end_column: {}\n", end_col.saturating_sub(1)));
+    if let Some(sel) = &c.selected_text {
+        out.push_str(&format!("    selected_text: {}\n", yaml_quoted(sel)));
+    }
 }
 
 fn position_for(raw: Option<&str>, pos: crate::parser::SourcePos) -> (u32, u32) {
@@ -129,15 +143,6 @@ fn line_char_count(raw: &str, line: u32) -> u32 {
     raw.split('\n').nth((line - 1) as usize).map_or(0, |s| {
         s.strip_suffix('\r').unwrap_or(s).chars().count() as u32
     })
-}
-
-/// Print the Sidemark dump to stdout. Must be called AFTER the alternate
-/// screen has been torn down (otherwise the YAML lands in the alt buffer and
-/// vanishes when the terminal restores the main screen).
-pub fn dump_to_stdout(inputs: DumpInputs<'_>) {
-    if let Some(yaml) = render(inputs) {
-        print!("{yaml}");
-    }
 }
 
 /// YAML double-quoted scalar with the escapes the spec leans on. Keeps

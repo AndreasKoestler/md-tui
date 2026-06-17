@@ -62,11 +62,31 @@ The hook fails **open**: any internal error lets the write proceed rather than
 blocking it. It can only ever surface review comments, never halt on its own
 malfunction.
 
+## Using the review popup
+
+When the popup opens, you are looking at the rendered Markdown in `mdt`. Attach
+comments like this:
+
+| Step | Key |
+|---|---|
+| Enter caret mode | `v` |
+| Enter comment mode | `c` |
+| Anchor a selection at the caret | `Space` |
+| Extend the selection | `j`/`k`/`h`/`l` or arrows |
+| Open the comment editor | `<Enter>` |
+| Type the comment, then save | text, then `<Enter>` |
+| Discard a selection/draft | `Esc` |
+| Jump between existing comments | `n` / `N` |
+| Finish and return to Claude | `q` |
+
+Press `q` to quit `mdt` once you are done; that closes the popup and hands your
+comments back. See [Comments and review](../README.md#comments-and-review) for
+the full flow.
+
 ## How it works
 
 On a matching `Write`, the hook opens `mdt` in a `tmux popup` with
-`MDT_DUMP_PATH` set to a temp file. You enter comment mode, attach comments to
-ranges of the rendered markdown, and quit. md-tui writes a Sidemark YAML dump to
-that file (nothing is written if there are no comments). The hook parses the
-dump and emits the comments as `hookSpecificOutput.additionalContext` so Claude
-picks them up on its next turn.
+`MDT_DUMP_PATH` set to a temp file. You comment as above and quit. md-tui writes
+a Sidemark YAML dump to that file (nothing is written if there are no comments).
+The hook parses the dump and emits the comments as
+`hookSpecificOutput.additionalContext` so Claude picks them up on its next turn.

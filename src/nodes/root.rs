@@ -189,32 +189,31 @@ impl ComponentRoot {
         }
     }
 
-    #[must_use]
-    pub fn link_index_and_height(&self) -> Vec<(usize, u16)> {
-        let mut indexes = Vec::new();
-        let mut count = 0;
+    /// The visible (non-hidden) text components in document order.
+    fn visible_text_components(&self) -> impl Iterator<Item = &TextComponent> {
         self.components
             .iter()
-            .filter_map(|f| match f {
+            .filter_map(|c| match c {
                 Component::TextComponent(comp) => Some(comp),
                 Component::Image(_) => None,
             })
             .filter(|comp| !comp.is_hidden())
-            .for_each(|comp| {
-                let height = comp.y_offset();
-                comp.content().iter().enumerate().for_each(|(index, row)| {
-                    row.iter().for_each(|c| {
-                        if matches!(
-                            c.kind(),
-                            WordType::Link | WordType::Selected | WordType::FootnoteInline
-                        ) {
-                            indexes.push((count, height + index as u16));
-                            count += 1;
-                        }
-                    });
-                });
-            });
+    }
 
+    #[must_use]
+    pub fn link_index_and_height(&self) -> Vec<(usize, u16)> {
+        let mut indexes = Vec::new();
+        let mut base = 0;
+        // One ordinal per link *group* (a link can render as several
+        // consecutive words), numbered continuously across components so the
+        // index matches `select` / `num_links`.
+        for comp in self.visible_text_components() {
+            let groups = comp_link_groups(comp, comp.y_offset());
+            for &(ord, line) in &groups {
+                indexes.push((base + ord, line));
+            }
+            base += groups.len();
+        }
         indexes
     }
 
@@ -226,40 +225,17 @@ impl ComponentRoot {
     /// outline jumps still behave as before). Ordinals match
     /// `link_index_and_height` / `select` / `link_anchor_at`.
     pub fn link_index_at_caret(&self, caret: crate::util::Caret) -> Option<usize> {
-        let mut count = 0;
+        let mut base = 0;
         let mut first_on_line = None;
-        for comp in self
-            .components
-            .iter()
-            .filter_map(|f| match f {
-                Component::TextComponent(comp) => Some(comp),
-                Component::Image(_) => None,
-            })
-            .filter(|comp| !comp.is_hidden())
-        {
-            let base_y = comp.y_offset();
-            for (row_idx, row) in comp.content().iter().enumerate() {
-                let line_y = base_y + row_idx as u16;
-                let mut current_x = 0u16;
-                for word in row {
-                    let word_width = display_width(word.content()) as u16;
-                    if matches!(
-                        word.kind(),
-                        WordType::Link | WordType::Selected | WordType::FootnoteInline
-                    ) {
-                        if line_y == caret.line {
-                            if first_on_line.is_none() {
-                                first_on_line = Some(count);
-                            }
-                            if caret.col >= current_x && caret.col < current_x + word_width {
-                                return Some(count);
-                            }
-                        }
-                        count += 1;
-                    }
-                    current_x += word_width;
-                }
+        for comp in self.visible_text_components() {
+            let hit = comp_link_at_caret(comp, comp.y_offset(), caret);
+            if let Some(ord) = hit.hit {
+                return Some(base + ord);
             }
+            if first_on_line.is_none() {
+                first_on_line = hit.first_on_line.map(|ord| base + ord);
+            }
+            base += hit.group_count;
         }
         first_on_line
     }
@@ -756,6 +732,103 @@ impl ComponentRoot {
     }
 }
 
+/// A word that participates in a link (its display word or a footnote ref).
+fn is_link_word(kind: WordType) -> bool {
+    matches!(
+        kind,
+        WordType::Link | WordType::Selected | WordType::FootnoteInline
+    )
+}
+
+/// One rendered link word: its group `ord` (local to the component, shared by
+/// every word of the same link), the row it's on, and its `[x_start, x_end)`
+/// column span.
+struct LinkCell {
+    ord: usize,
+    line: u16,
+    x_start: u16,
+    x_end: u16,
+}
+
+/// All link-word cells in `comp` plus the total link-group count. A link can
+/// render as several consecutive words (display text split on spaces or wrapped
+/// across rows); each run of consecutive link words shares one `ord`.
+fn comp_link_cells(comp: &TextComponent, base_y: u16) -> (Vec<LinkCell>, usize) {
+    let mut cells = Vec::new();
+    let mut ord = 0;
+    let mut in_link = false;
+    for (i, row) in comp.content().iter().enumerate() {
+        let line_y = base_y + i as u16;
+        let mut x = 0u16;
+        for word in row {
+            let width = display_width(word.content()) as u16;
+            if is_link_word(word.kind()) {
+                cells.push(LinkCell {
+                    ord,
+                    line: line_y,
+                    x_start: x,
+                    x_end: x + width,
+                });
+                in_link = true;
+            } else if in_link {
+                ord += 1;
+                in_link = false;
+            }
+            x += width;
+        }
+    }
+    let count = if in_link { ord + 1 } else { ord };
+    (cells, count)
+}
+
+/// `(local ordinal, start row)` of each link group — the first cell of each
+/// distinct `ord`.
+fn comp_link_groups(comp: &TextComponent, base_y: u16) -> Vec<(usize, u16)> {
+    let (cells, _) = comp_link_cells(comp, base_y);
+    let mut out = Vec::new();
+    let mut last = None;
+    for c in &cells {
+        if last != Some(c.ord) {
+            out.push((c.ord, c.line));
+            last = Some(c.ord);
+        }
+    }
+    out
+}
+
+/// Outcome of resolving a caret within one component's link groups. Ordinals
+/// are local to the component; the caller offsets them by a running base.
+struct CaretLink {
+    /// Group whose rendered cells contain the caret column, if any.
+    hit: Option<usize>,
+    /// First link group on the caret's line (column-independent fallback).
+    first_on_line: Option<usize>,
+    /// Total number of link groups in the component (for ordinal accounting).
+    group_count: usize,
+}
+
+fn comp_link_at_caret(comp: &TextComponent, base_y: u16, caret: crate::util::Caret) -> CaretLink {
+    let (cells, count) = comp_link_cells(comp, base_y);
+    let mut first_on_line = None;
+    for c in &cells {
+        if c.line == caret.line {
+            first_on_line.get_or_insert(c.ord);
+            if (c.x_start..c.x_end).contains(&caret.col) {
+                return CaretLink {
+                    hit: Some(c.ord),
+                    first_on_line,
+                    group_count: count,
+                };
+            }
+        }
+    }
+    CaretLink {
+        hit: None,
+        first_on_line,
+        group_count: count,
+    }
+}
+
 struct SelectionContext<'a> {
     line_y: u16,
     start: crate::util::Caret,
@@ -851,6 +924,32 @@ mod tests {
         assert_eq!(root.link_index_at_caret(Caret { line: 9, col: 0 }), None);
     }
 
+    #[test]
+    fn link_index_at_caret_counts_a_multiword_link_as_one_ordinal() {
+        // A single link whose display text was split into two consecutive Link
+        // words (e.g. wrapped across a row) must advance the ordinal once, so a
+        // following link is index 1 — matching `num_links` / `link_anchor_at`.
+        // Cols: "click"=0..5, "here"=5..9, space=9..10, "[b]"=10..13.
+        let words = vec![
+            Word::new("click".to_owned(), WordType::Link),
+            Word::new("here".to_owned(), WordType::Link),
+            Word::new(" ".to_owned(), WordType::Normal),
+            Word::new("[b]".to_owned(), WordType::Link),
+        ];
+        let mut comp = TextComponent::new(TextNode::Paragraph, words);
+        comp.set_y_offset(0);
+        let root = ComponentRoot::new(None, vec![Component::TextComponent(comp)]);
+
+        // Both words of the first link resolve to ordinal 0.
+        assert_eq!(root.link_index_at_caret(Caret { line: 0, col: 2 }), Some(0));
+        assert_eq!(root.link_index_at_caret(Caret { line: 0, col: 6 }), Some(0));
+        // The second link is ordinal 1, not 2.
+        assert_eq!(
+            root.link_index_at_caret(Caret { line: 0, col: 11 }),
+            Some(1)
+        );
+    }
+
     // --- Comment anchoring: caret <-> source-span round trips -------------
     //
     // These build components out of words carrying *real* source spans (byte
@@ -876,7 +975,7 @@ mod tests {
                 column: 1,
             },
         };
-        Word::new_source(content.to_owned(), WordType::Normal, span)
+        Word::new_with_source_span(content.to_owned(), WordType::Normal, Some(span))
     }
 
     fn paragraph(y: u16, words: Vec<Word>) -> ComponentRoot {
@@ -1051,5 +1150,145 @@ mod tests {
         let ranges = &projections[0].rendered;
         assert_eq!(ranges.first().unwrap().start, Caret { line: 0, col: 0 });
         assert_eq!(ranges.last().unwrap().end, Caret { line: 0, col: 11 });
+    }
+
+    // --- link_index_and_height / link_anchor_at / select ------------------
+
+    /// A single-row paragraph `Component` at `y` built from `words`.
+    fn para_comp(y: u16, words: Vec<Word>) -> Component {
+        let mut comp = TextComponent::new(TextNode::Paragraph, words);
+        comp.set_y_offset(y);
+        Component::TextComponent(comp)
+    }
+
+    /// One Link word plus its `LinkData` (URL) word, as the parser emits them.
+    fn link_words(text: &str, url: &str) -> Vec<Word> {
+        vec![
+            Word::new(text.to_owned(), WordType::Link),
+            Word::new(url.to_owned(), WordType::LinkData),
+        ]
+    }
+
+    #[test]
+    fn link_index_and_height_groups_consecutive_link_words() {
+        // "click here" (two Link words) is one link; "[b]" is a second.
+        let words = vec![
+            Word::new("click".to_owned(), WordType::Link),
+            Word::new("here".to_owned(), WordType::Link),
+            Word::new(" ".to_owned(), WordType::Normal),
+            Word::new("[b]".to_owned(), WordType::Link),
+        ];
+        let root = paragraph(3, words);
+        // One ordinal per link, both on the component's row (y_offset 3).
+        assert_eq!(root.link_index_and_height(), vec![(0, 3), (1, 3)]);
+    }
+
+    #[test]
+    fn link_index_and_height_spans_wrapped_link_across_rows() {
+        // A link wrapped onto two rows stays one ordinal, anchored at its
+        // first row; a following link is ordinal 1 on the second row.
+        let rows = vec![
+            vec![Word::new("click".to_owned(), WordType::Link)],
+            vec![
+                Word::new("here".to_owned(), WordType::Link),
+                Word::new(" ".to_owned(), WordType::Normal),
+                Word::new("[b]".to_owned(), WordType::Link),
+            ],
+        ];
+        let root = multiline(10, rows);
+        assert_eq!(root.link_index_and_height(), vec![(0, 10), (1, 11)]);
+    }
+
+    #[test]
+    fn link_anchor_at_returns_nth_url_else_none() {
+        let root = ComponentRoot::new(
+            None,
+            vec![
+                para_comp(0, link_words("first", "https://a.example")),
+                para_comp(5, link_words("second", "https://b.example")),
+            ],
+        );
+        assert_eq!(root.link_anchor_at(0), Some("https://a.example"));
+        assert_eq!(root.link_anchor_at(1), Some("https://b.example"));
+        assert_eq!(root.link_anchor_at(2), None);
+    }
+
+    #[test]
+    fn select_returns_component_offset_and_errors_out_of_bounds() {
+        let mut root = ComponentRoot::new(
+            None,
+            vec![
+                para_comp(0, link_words("first", "https://a.example")),
+                para_comp(7, link_words("second", "https://b.example")),
+            ],
+        );
+        assert_eq!(root.select(0), Ok(0));
+        assert_eq!(root.select(1), Ok(7));
+        assert!(root.select(2).is_err());
+    }
+
+    #[test]
+    fn heading_offset_sums_preceding_heights_else_errors() {
+        // A two-row paragraph (height 2) precedes the heading.
+        let filler = TextComponent::new_formatted(
+            TextNode::Paragraph,
+            vec![
+                vec![Word::new("a".to_owned(), WordType::Normal)],
+                vec![Word::new("b".to_owned(), WordType::Normal)],
+            ],
+        );
+        let heading = TextComponent::new_formatted(
+            TextNode::Heading,
+            vec![vec![Word::new("Title".to_owned(), WordType::Normal)]],
+        );
+        let root = ComponentRoot::new(
+            None,
+            vec![
+                Component::TextComponent(filler),
+                Component::TextComponent(heading),
+            ],
+        );
+        assert_eq!(root.heading_offset("#title"), Ok(2));
+        assert!(root.heading_offset("#missing").is_err());
+    }
+
+    #[test]
+    fn find_footnote_returns_body_for_matching_ref_else_message() {
+        let words = vec![
+            Word::new("1".to_owned(), WordType::FootnoteData), // meta-info ref key
+            Word::new("the body".to_owned(), WordType::Footnote),
+        ];
+        let comp = TextComponent::new(TextNode::Footnote, words);
+        let root = ComponentRoot::new(None, vec![Component::TextComponent(comp)]);
+        assert_eq!(root.find_footnote("1"), "the body");
+        assert_eq!(root.find_footnote("2"), "Footnote not found");
+    }
+
+    #[test]
+    fn details_index_and_height_lists_visible_summaries_only() {
+        let mk = |id, y| {
+            let mut c = TextComponent::new(
+                TextNode::DetailsSummary {
+                    id,
+                    folded: false,
+                    body_len: 0,
+                },
+                vec![Word::new("Summary".to_owned(), WordType::Normal)],
+            );
+            c.set_y_offset(y);
+            c
+        };
+        let mut hidden = mk(3, 20);
+        hidden.set_hidden(true);
+        let root = ComponentRoot::new(
+            None,
+            vec![
+                Component::TextComponent(mk(1, 2)),
+                Component::TextComponent(mk(2, 8)),
+                Component::TextComponent(hidden),
+            ],
+        );
+        // Hidden summary excluded; indices are sequential over visible ones.
+        assert_eq!(root.details_index_and_height(), vec![(0, 2), (1, 8)]);
     }
 }

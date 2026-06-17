@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use notify::{PollWatcher, Watcher};
 
 use crate::{
-    bookmarks::BookmarkStore,
+    bookmarks,
     comments::CommentState,
     nodes::{root::ComponentRoot, word::WordType},
     pages::{file_explorer::FileTree, markdown_renderer::markdown_view_area},
@@ -54,7 +54,9 @@ pub(crate) fn viewport_height(height: u16) -> u16 {
     if GENERAL_CONFIG.footer {
         h = h.saturating_sub(1);
     }
-    h
+    // Never return 0: callers divide and take the modulo by this (file
+    // explorer paging), so a viewport of 0 on a tiny terminal would panic.
+    h.max(1)
 }
 
 fn handle_comment_mode_key(
@@ -71,23 +73,12 @@ fn handle_comment_mode_key(
     }
 }
 
-fn handle_comment_state_none(key: KeyCode, app: &mut App, vh: u16) -> bool {
+fn handle_comment_state_none(key: KeyCode, app: &mut App, _vh: u16) -> bool {
     use Action::*;
     match key_to_action(key) {
-        SearchNext if !app.comments.is_empty() => {
-            if !app.caret_mode {
-                app.toggle_caret_mode(vh);
-            }
-            app.cycle_comment(true, vh);
-            true
-        }
-        SearchPrevious if !app.comments.is_empty() => {
-            if !app.caret_mode {
-                app.toggle_caret_mode(vh);
-            }
-            app.cycle_comment(false, vh);
-            true
-        }
+        // `n`/`N` must NOT be hijacked here: while comment mode is off they
+        // belong to search-next/previous (dispatched later in the handler).
+        // Comment cycling lives in `Browsing` only.
         Enter => app.start_editing_active_or_caret(),
         _ => false,
     }
@@ -149,22 +140,25 @@ fn handle_comment_state_editing(key: KeyCode, app: &mut App, markdown: &mut Comp
             if let CommentState::Editing { draft, cursor, .. } = &mut app.comment_state
                 && *cursor > 0
             {
-                // Only ASCII is ever inserted (see the `Char` arm), so `cursor`
-                // is always on a char boundary and the byte-indexed `remove` is
-                // safe. The assert guards against that invariant being broken by
-                // a future paste/edit path.
-                debug_assert!(draft.is_char_boundary(*cursor - 1));
-                draft.remove(*cursor - 1);
-                *cursor -= 1;
+                // `cursor` is a byte offset kept on a char boundary (it only
+                // ever moves by whole `char`s), so step back to the previous
+                // boundary and remove that whole `char` — correct for multi-byte
+                // input, never a mid-codepoint panic.
+                let prev = draft[..*cursor]
+                    .char_indices()
+                    .next_back()
+                    .map_or(0, |(i, _)| i);
+                draft.remove(prev);
+                *cursor = prev;
             }
             true
         }
         KeyCode::Char(c) => {
-            if c.is_ascii()
-                && let CommentState::Editing { draft, cursor, .. } = &mut app.comment_state
-            {
+            if let CommentState::Editing { draft, cursor, .. } = &mut app.comment_state {
+                // `cursor` is always on a char boundary, so inserting any
+                // `char` is safe; advance by its UTF-8 byte length.
                 draft.insert(*cursor, c);
-                *cursor += 1;
+                *cursor += c.len_utf8();
             }
             true
         }
@@ -175,7 +169,7 @@ fn handle_comment_state_editing(key: KeyCode, app: &mut App, markdown: &mut Comp
 fn persist_marks(markdown: &ComponentRoot, app: &mut App) {
     if let Some(path) = markdown.file_name() {
         let p = std::path::PathBuf::from(path);
-        let _ = BookmarkStore::save_for(&p, &app.bookmarks, GENERAL_CONFIG.width);
+        let _ = bookmarks::save_for(&p, &app.bookmarks, GENERAL_CONFIG.width);
         app.bookmark_origin_width = GENERAL_CONFIG.width;
     }
 }
@@ -252,6 +246,31 @@ pub fn handle_mouse_input(
     }
 }
 
+/// Map a left-click at the mouse's (row, col) to a document caret, or `None`
+/// when the click lands outside the markdown area or past rendered content.
+fn project_click(
+    mouse: MouseEvent,
+    app: &App,
+    markdown: &ComponentRoot,
+    area: &ratatui::layout::Rect,
+) -> Option<Caret> {
+    let in_area = mouse.column >= area.x
+        && mouse.column < area.x + area.width
+        && mouse.row >= area.y
+        && mouse.row < area.y + area.height;
+    if !in_area {
+        return None;
+    }
+    let line = app.vertical_scroll + (mouse.row - area.y);
+    if line >= markdown.height() {
+        return None;
+    }
+    Some(Caret {
+        line,
+        col: mouse.column - area.x,
+    })
+}
+
 fn handle_mouse_down(
     mouse: MouseEvent,
     app: &mut App,
@@ -260,57 +279,43 @@ fn handle_mouse_down(
     vh: u16,
     term_height: u16,
 ) {
-    let in_area = mouse.column >= area.x
-        && mouse.column < area.x + area.width
-        && mouse.row >= area.y
-        && mouse.row < area.y + area.height;
-
-    if !in_area {
+    let Some(click) = project_click(mouse, app, markdown, area) else {
         app.mouse_drag_anchor = None;
         return;
-    }
+    };
 
-    let doc_line = app.vertical_scroll + (mouse.row - area.y);
-    let doc_col = mouse.column - area.x;
-    if doc_line >= markdown.height() {
-        app.mouse_drag_anchor = None;
-        return;
-    }
-
-    if let Some(idx) = markdown.link_index_at_caret(Caret {
-        line: doc_line,
-        col: doc_col,
-    }) && let Some(anchor) = markdown.link_anchor_at(idx)
+    // Click on a TOC (`#`) link: jump the outline, don't start a selection.
+    if let Some(idx) = markdown.link_index_at_caret(click)
+        && let Some(anchor) = markdown.link_anchor_at(idx)
         && anchor.starts_with('#')
     {
-        app.caret.line = doc_line;
-        app.caret.col = doc_col;
+        app.caret = click;
         try_outline_jump(app, markdown, vh, term_height);
         app.mouse_drag_anchor = None;
         return;
     }
 
+    // A click in scroll mode promotes to caret mode (and remembers to demote
+    // again once the comment edit it may start finishes).
     let was_in_scroll = !app.caret_mode;
     if was_in_scroll {
         app.toggle_caret_mode(vh);
     }
-
     if matches!(app.comment_state, CommentState::Selecting { .. }) {
         app.comment_state = CommentState::Off;
     }
-    app.caret.line = doc_line;
-    app.caret.col = doc_col;
-
+    app.caret = click;
     if was_in_scroll {
         app.auto_caret_for_comment_edit = true;
     }
 
+    // If the click landed on an existing comment, open it; otherwise arm a
+    // drag so a subsequent move starts a selection.
     if app.start_editing_active_or_caret() {
         app.mouse_drag_anchor = None;
-        return;
+    } else {
+        app.mouse_drag_anchor = Some(app.caret);
     }
-
-    app.mouse_drag_anchor = Some(app.caret);
 }
 
 fn handle_mouse_drag(
@@ -458,6 +463,27 @@ fn handle_file_tree_none_box_key(
     KeyBoardAction::Continue
 }
 
+/// Shared tail of the three file-open paths: parse `text` as the document
+/// named `name` at `path`, point the file watcher at it, and load its
+/// bookmarks. The caller owns `reset`/scroll/mode and must set `app.raw_source`
+/// itself *after* any `reset` (which clears it).
+fn open_document(
+    app: &mut App,
+    markdown: &mut ComponentRoot,
+    path: &std::path::Path,
+    name: &str,
+    text: &str,
+    watcher: &mut Option<PollWatcher>,
+) {
+    *markdown = parse_markdown(Some(name), text, app.width() - 2);
+    if let Some(w) = watcher.as_mut() {
+        let _ = w.watch(path, notify::RecursiveMode::NonRecursive);
+    }
+    let (marks, bw) = bookmarks::load_for(path);
+    app.bookmarks = marks;
+    app.bookmark_origin_width = bw;
+}
+
 fn handle_file_tree_enter_action(
     app: &mut App,
     markdown: &mut ComponentRoot,
@@ -482,17 +508,11 @@ fn handle_file_tree_enter_action(
         return Some(KeyBoardAction::Continue);
     };
 
-    *markdown = parse_markdown(Some(file.path_str()), &text, app.width() - 2);
+    open_document(app, markdown, file.path(), file.path_str(), &text, watcher);
     app.raw_source = Some(text);
-    if let Some(w) = watcher.as_mut() {
-        let _ = w.watch(file.path(), notify::RecursiveMode::NonRecursive);
-    }
     app.mode = Mode::View;
     app.help_box.set_mode(Mode::View);
     app.select_index = 0;
-    let (marks, w) = BookmarkStore::load_for(file.path());
-    app.bookmarks = marks;
-    app.bookmark_origin_width = w;
     None
 }
 
@@ -647,7 +667,6 @@ fn handle_markdown_file_link(
     watcher: &mut Option<PollWatcher>,
 ) {
     let text = if let Ok(file) = read_to_string(&path) {
-        app.vertical_scroll = 0;
         file
     } else {
         app.message_box
@@ -656,36 +675,30 @@ fn handle_markdown_file_link(
         return;
     };
 
+    // Record where we came from before `markdown` is replaced below.
     if let Some(file_name) = markdown.file_name() {
         app.history.push(Jump::File(file_name.to_string()));
     }
 
+    // Reset the *old* document's state (caret, comments, scroll, …) before
+    // loading the new one — must happen before `raw_source` is set, since
+    // `reset` clears it (and would also wipe a heading-not-found error box).
+    app.reset();
+
     let path_buf = std::path::Path::new(&path);
-    if let Some(w) = watcher.as_mut() {
-        let _ = w.watch(path_buf, notify::RecursiveMode::NonRecursive);
-    }
-    *markdown = parse_markdown(Some(&path), &text, app.width() - 2);
+    open_document(app, markdown, path_buf, &path, &text, watcher);
     app.raw_source = Some(text);
-    let (marks, bw) = BookmarkStore::load_for(path_buf);
-    app.bookmarks = marks;
-    app.bookmark_origin_width = bw;
-    let index = if let Some(heading) = heading {
+
+    if let Some(heading) = heading {
         if let Ok(index) = markdown.heading_offset(&format!("#{heading}")) {
             app.vertical_scroll = index;
             app.clamp_scroll(markdown.height(), height);
-            app.vertical_scroll
         } else {
             app.message_box
                 .set_message(format!("Could not find heading {heading}"));
             app.boxes = Boxes::Error;
-            0
         }
-    } else {
-        0
-    };
-
-    app.reset();
-    app.vertical_scroll = index;
+    }
 }
 
 fn handle_caret_mode(
@@ -700,43 +713,29 @@ fn handle_caret_mode(
     }
 
     let max = markdown.height();
-    match key {
-        KeyCode::Left => {
-            app.move_caret(0, -1, max, vh);
-            return true;
-        }
-        KeyCode::Right => {
-            app.move_caret(0, 1, max, vh);
-            return true;
-        }
-        _ => {}
+
+    // Caret moves expressed as a `(dy, dx)` delta. Horizontal moves arrive
+    // both as arrow keys and as `h`/`l` (which map to the HalfPage actions),
+    // so both spellings collapse to the same delta here.
+    let delta = match key {
+        KeyCode::Left => Some((0, -1)),
+        KeyCode::Right => Some((0, 1)),
+        _ => match action {
+            Action::Down => Some((1, 0)),
+            Action::Up => Some((-1, 0)),
+            Action::HalfPageDown => Some((0, 1)),
+            Action::HalfPageUp => Some((0, -1)),
+            Action::PageDown => Some(((vh / 2) as i32, 0)),
+            Action::PageUp => Some((-((vh / 2) as i32), 0)),
+            _ => None,
+        },
+    };
+    if let Some((dy, dx)) = delta {
+        app.move_caret(dy, dx, max, vh);
+        return true;
     }
 
     match action {
-        Action::Down => {
-            app.move_caret(1, 0, max, vh);
-            true
-        }
-        Action::Up => {
-            app.move_caret(-1, 0, max, vh);
-            true
-        }
-        Action::HalfPageDown => {
-            app.move_caret(0, 1, max, vh);
-            true
-        }
-        Action::HalfPageUp => {
-            app.move_caret(0, -1, max, vh);
-            true
-        }
-        Action::PageDown => {
-            app.move_caret((vh / 2) as i32, 0, max, vh);
-            true
-        }
-        Action::PageUp => {
-            app.move_caret(-((vh / 2) as i32), 0, max, vh);
-            true
-        }
         Action::ToTop => {
             app.caret_to_top(vh);
             true
@@ -802,14 +801,16 @@ fn handle_none_box_key(
 ) -> KeyBoardAction {
     let vh = viewport_height(height);
 
-    // Comment mode dispatch. Runs first so it can intercept keys before
-    // pending-input or caret-mode logic. Returns true when the key was
-    // consumed, false to fall through to the rest of the handler.
-    if handle_comment_mode_key(key, app, markdown, vh) {
+    // Pending-input capture (bookmark set/jump) takes the very next key, so it
+    // must run before comment dispatch — otherwise a `n`/`N` capture target
+    // would be swallowed by comment cycling while a bookmark name is pending.
+    if handle_pending_input(key, app, markdown, vh) {
         return KeyBoardAction::Continue;
     }
 
-    if handle_pending_input(key, app, markdown, vh) {
+    // Comment mode dispatch. Returns true when the key was consumed, false to
+    // fall through to the rest of the handler.
+    if handle_comment_mode_key(key, app, markdown, vh) {
         return KeyBoardAction::Continue;
     }
 
@@ -819,38 +820,21 @@ fn handle_none_box_key(
         return KeyBoardAction::Continue;
     }
 
-    // Universal actions, available regardless of mode.
     match action {
-        Action::ToggleCaretMode => {
-            app.toggle_caret_mode(vh);
-            return KeyBoardAction::Continue;
-        }
+        // Universal actions, available regardless of mode.
+        Action::ToggleCaretMode => app.toggle_caret_mode(vh),
         Action::EnterCommentMode => {
             let _ = app.toggle_comment_mode();
-            return KeyBoardAction::Continue;
         }
         Action::StartCommentSelect => {
             if app.caret_mode {
                 let _ = app.start_selecting();
             }
-            return KeyBoardAction::Continue;
         }
-        Action::BookmarkSetPending => {
-            app.pending_input = Some(PendingInput::BookmarkSet);
-            return KeyBoardAction::Continue;
-        }
-        Action::BookmarkJumpPending => {
-            app.pending_input = Some(PendingInput::BookmarkJump);
-            return KeyBoardAction::Continue;
-        }
-        Action::Outline => {
-            try_outline_jump(app, markdown, vh, height);
-            return KeyBoardAction::Continue;
-        }
-        _ => {}
-    }
+        Action::BookmarkSetPending => app.pending_input = Some(PendingInput::BookmarkSet),
+        Action::BookmarkJumpPending => app.pending_input = Some(PendingInput::BookmarkJump),
+        Action::Outline => try_outline_jump(app, markdown, vh, height),
 
-    match action {
         Action::Down => app.scroll(ScrollAction::Down, markdown, height),
         Action::Up => app.scroll(ScrollAction::Up, markdown, height),
         Action::ToTop => app.scroll(ScrollAction::ToTop, markdown, height),
@@ -914,18 +898,12 @@ fn handle_back_action(
                 app.boxes = Boxes::Error;
                 return;
             };
-            *markdown = parse_markdown(Some(&e), &text, app.width() - 2);
             let path = std::path::Path::new(&e);
-            if let Some(w) = watcher.as_mut() {
-                let _ = w.watch(path, notify::RecursiveMode::NonRecursive);
-            }
             app.reset();
+            open_document(app, markdown, path, &e, &text, watcher);
             app.raw_source = Some(text);
             app.mode = Mode::View;
             app.help_box.set_mode(Mode::View);
-            let (marks, bw) = BookmarkStore::load_for(path);
-            app.bookmarks = marks;
-            app.bookmark_origin_width = bw;
         }
         Jump::FileTree => {
             markdown.clear();
@@ -1132,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn editing_non_ascii_char_is_ignored() {
+    fn editing_accepts_non_ascii_and_backspaces_whole_chars() {
         let mut app = App::default();
         app.comment_state = CommentState::Editing {
             range: (caret(0, 0), caret(0, 0)),
@@ -1142,9 +1120,19 @@ mod tests {
             source: CommentModeSource::Caret,
         };
         let mut md = empty_markdown();
-        // Consumed (returns true) but the ASCII-only editor drops it.
+
+        // 'é' is 2 bytes: it is inserted and the byte cursor advances by 2.
         assert!(handle_comment_mode_key(
             KeyCode::Char('é'),
+            &mut app,
+            &mut md,
+            VH
+        ));
+        assert_eq!(draft_of(&app), Some(("é".to_string(), 2)));
+
+        // Backspace removes the whole multi-byte char without panicking.
+        assert!(handle_comment_mode_key(
+            KeyCode::Backspace,
             &mut app,
             &mut md,
             VH
@@ -1312,5 +1300,215 @@ mod tests {
             20,
         );
         assert_eq!(app.mouse_drag_anchor, None, "search box swallows the click");
+    }
+
+    // --- handle_pending_input ---------------------------------------------
+
+    #[test]
+    fn pending_input_noop_without_pending() {
+        let mut app = App::default();
+        let mut md = empty_markdown();
+        assert!(!handle_pending_input(
+            KeyCode::Char('a'),
+            &mut app,
+            &mut md,
+            VH
+        ));
+    }
+
+    #[test]
+    fn pending_input_bookmark_set_records_caret() {
+        let mut app = App::default();
+        app.pending_input = Some(PendingInput::BookmarkSet);
+        app.caret = caret(5, 3);
+        let mut md = empty_markdown(); // no file name -> persist is a no-op
+        assert!(handle_pending_input(
+            KeyCode::Char('a'),
+            &mut app,
+            &mut md,
+            VH
+        ));
+        assert_eq!(app.bookmarks.get(&'a'), Some(&caret(5, 3)));
+        assert!(app.pending_input.is_none());
+    }
+
+    #[test]
+    fn pending_input_bookmark_jump_moves_caret() {
+        let mut app = App::default();
+        app.bookmarks.insert('b', caret(9, 2));
+        app.pending_input = Some(PendingInput::BookmarkJump);
+        let mut md = empty_markdown();
+        assert!(handle_pending_input(
+            KeyCode::Char('b'),
+            &mut app,
+            &mut md,
+            VH
+        ));
+        assert_eq!(app.caret, caret(9, 2));
+    }
+
+    // --- handle_caret_mode ------------------------------------------------
+
+    #[test]
+    fn caret_mode_dispatch_ignored_when_off() {
+        let mut app = App::default();
+        let md = doc();
+        let key = KeyCode::Right;
+        assert!(!handle_caret_mode(
+            key,
+            &key_to_action(key),
+            &mut app,
+            &md,
+            VH
+        ));
+    }
+
+    #[test]
+    fn caret_mode_moves_caret_horizontally() {
+        let mut app = App::default();
+        app.set_width(10);
+        app.caret_mode = true;
+        let md = doc();
+        let right = KeyCode::Right;
+        assert!(handle_caret_mode(
+            right,
+            &key_to_action(right),
+            &mut app,
+            &md,
+            VH
+        ));
+        assert_eq!(app.caret.col, 1);
+        let left = KeyCode::Left;
+        assert!(handle_caret_mode(
+            left,
+            &key_to_action(left),
+            &mut app,
+            &md,
+            VH
+        ));
+        assert_eq!(app.caret.col, 0);
+    }
+
+    #[test]
+    fn caret_mode_escape_exits() {
+        let mut app = App::default();
+        app.caret_mode = true;
+        let md = doc();
+        assert!(handle_caret_mode(
+            KeyCode::Esc,
+            &Action::Escape,
+            &mut app,
+            &md,
+            VH
+        ));
+        assert!(!app.caret_mode);
+    }
+
+    // --- handle_none_box_key ----------------------------------------------
+
+    #[test]
+    fn none_box_key_toggles_caret_mode() {
+        let mut app = App::default();
+        let mut md = doc();
+        let mut watcher: Option<PollWatcher> = None;
+        let _ = handle_none_box_key(
+            KeyCode::Char(KEY_CONFIG.toggle_caret),
+            &mut app,
+            &mut md,
+            20,
+            &mut watcher,
+        );
+        assert!(app.caret_mode);
+    }
+
+    #[test]
+    fn none_box_key_arms_bookmark_pending() {
+        let mut app = App::default();
+        let mut md = doc();
+        let mut watcher: Option<PollWatcher> = None;
+        let _ = handle_none_box_key(
+            KeyCode::Char(KEY_CONFIG.bookmark_set),
+            &mut app,
+            &mut md,
+            20,
+            &mut watcher,
+        );
+        assert_eq!(app.pending_input, Some(PendingInput::BookmarkSet));
+    }
+
+    #[test]
+    fn none_box_key_escape_clears_selection() {
+        let mut app = App::default();
+        app.selected = true;
+        let mut md = doc();
+        let mut watcher: Option<PollWatcher> = None;
+        let _ = handle_none_box_key(KeyCode::Esc, &mut app, &mut md, 20, &mut watcher);
+        assert!(!app.selected);
+    }
+
+    // --- handle_enter_action (no-link paths; link-follow does IO) ---------
+
+    #[test]
+    fn enter_action_none_when_nothing_selected() {
+        let mut app = App::default();
+        let mut md = doc();
+        let mut watcher: Option<PollWatcher> = None;
+        assert!(handle_enter_action(&mut app, &mut md, VH, 20, &mut watcher).is_none());
+    }
+
+    #[test]
+    fn enter_action_in_caret_mode_off_a_link_clears_selection() {
+        let mut app = App::default();
+        app.caret_mode = true;
+        app.selected = true;
+        app.caret = caret(0, 0); // "hello world foo bar" has no links
+        let mut md = doc();
+        let mut watcher: Option<PollWatcher> = None;
+        assert!(handle_enter_action(&mut app, &mut md, VH, 20, &mut watcher).is_none());
+        assert!(!app.selected);
+    }
+
+    // --- intentional behavior contracts (locked against regression) -------
+
+    #[test]
+    fn search_keys_fall_through_when_comment_mode_off() {
+        // With comment mode Off, `n`/`N` belong to search and must NOT be
+        // consumed by comment dispatch (so they reach the search handler).
+        let mut app = App::default();
+        push_comment(&mut app, caret(5, 0), caret(5, 1)); // a comment exists
+        let n = KeyCode::Char(KEY_CONFIG.search_next);
+        assert!(
+            !handle_comment_state_none(n, &mut app, VH),
+            "n must not be consumed in CommentState::Off"
+        );
+        assert_eq!(app.active_comment, None, "no comment cycling while Off");
+        assert_eq!(app.comment_state, CommentState::Off);
+    }
+
+    #[test]
+    fn armed_bookmark_wins_over_comment_cycling() {
+        // Browsing with a comment present: an armed bookmark capture must take
+        // the next key (`n`) instead of comment-cycling consuming it.
+        let mut app = App::default();
+        app.comment_state = CommentState::Browsing;
+        app.caret = caret(7, 2);
+        push_comment(&mut app, caret(5, 0), caret(5, 1));
+        app.pending_input = Some(PendingInput::BookmarkSet);
+        let mut md = doc();
+        let mut watcher: Option<PollWatcher> = None;
+        let _ = handle_none_box_key(
+            KeyCode::Char(KEY_CONFIG.search_next),
+            &mut app,
+            &mut md,
+            20,
+            &mut watcher,
+        );
+        assert_eq!(
+            app.bookmarks.get(&'n'),
+            Some(&caret(7, 2)),
+            "n set the bookmark"
+        );
+        assert!(app.pending_input.is_none());
+        assert_eq!(app.active_comment, None, "comment was not cycled");
     }
 }

@@ -210,10 +210,8 @@ impl App {
             .min_by_key(|(_, row)| (*row).abs_diff(self.vertical_scroll + viewport_height / 3));
 
         if let Some((index, _)) = next {
-            if let Ok(scroll) = markdown.select(*index) {
-                self.select_index = *index;
-                self.vertical_scroll = scroll.saturating_sub(viewport_height / 3);
-            }
+            self.select_index = *index;
+            self.scroll_to_selected(markdown, viewport_height);
             self.selected = true;
         }
     }
@@ -237,6 +235,12 @@ impl App {
 
         self.select_index = index;
         self.selected = true;
+        self.scroll_to_selected(markdown, viewport_height);
+    }
+
+    /// Select the link at `self.select_index` and scroll it to roughly a third
+    /// down the viewport (the resting position links share across navigation).
+    fn scroll_to_selected(&mut self, markdown: &mut ComponentRoot, viewport_height: u16) {
         if let Ok(scroll) = markdown.select(self.select_index) {
             self.vertical_scroll = scroll.saturating_sub(viewport_height / 3);
         }
@@ -275,9 +279,7 @@ impl App {
                         self.select_index + 1,
                         markdown.num_links().saturating_sub(1),
                     );
-                    if let Ok(scroll) = markdown.select(self.select_index) {
-                        self.vertical_scroll = scroll.saturating_sub(viewport_height / 3);
-                    }
+                    self.scroll_to_selected(markdown, viewport_height);
                 } else {
                     self.vertical_scroll = self.vertical_scroll.saturating_add(1);
                     self.clamp_scroll(markdown.height(), viewport_height);
@@ -286,9 +288,7 @@ impl App {
             ScrollAction::Up => {
                 if self.selected {
                     self.select_index = self.select_index.saturating_sub(1);
-                    if let Ok(scroll) = markdown.select(self.select_index) {
-                        self.vertical_scroll = scroll.saturating_sub(viewport_height / 3);
-                    }
+                    self.scroll_to_selected(markdown, viewport_height);
                 } else {
                     self.vertical_scroll = self.vertical_scroll.saturating_sub(1);
                 }
@@ -368,6 +368,23 @@ impl App {
         }
     }
 
+    /// True when the caret's line is not within the current viewport (or the
+    /// viewport has zero rows).
+    fn caret_offscreen(&self, viewport_height: u16) -> bool {
+        viewport_height == 0
+            || self.caret.line < self.vertical_scroll
+            || self.caret.line >= self.vertical_scroll + viewport_height
+    }
+
+    /// Move the caret to `target` and center its line in the viewport. Used by
+    /// outline-mark, bookmark, and comment-cycle jumps.
+    fn jump_caret_centered(&mut self, target: Caret, viewport_height: u16) {
+        self.caret = target;
+        if viewport_height > 0 {
+            self.vertical_scroll = target.line.saturating_sub(viewport_height / 2);
+        }
+    }
+
     pub fn clamp_scroll(&mut self, markdown_height: u16, viewport_height: u16) {
         self.vertical_scroll = cmp::min(
             self.vertical_scroll,
@@ -383,10 +400,7 @@ impl App {
         self.caret_mode = !self.caret_mode;
         if self.caret_mode {
             // Snap caret into the visible viewport if it's currently outside.
-            if viewport_height == 0
-                || self.caret.line < self.vertical_scroll
-                || self.caret.line >= self.vertical_scroll + viewport_height
-            {
+            if self.caret_offscreen(viewport_height) {
                 self.caret.line = self.vertical_scroll;
                 self.caret.col = 0;
             }
@@ -447,21 +461,13 @@ impl App {
             self.outline_mark = None;
             return;
         }
-        self.caret = mark;
-        if viewport_height > 0 {
-            let center = viewport_height / 2;
-            self.vertical_scroll = self.caret.line.saturating_sub(center);
-        }
+        self.jump_caret_centered(mark, viewport_height);
     }
 
     #[must_use = "the bool reports whether the named bookmark exists"]
     pub fn jump_bookmark(&mut self, ch: char, viewport_height: u16) -> bool {
         if let Some(target) = self.bookmarks.get(&ch).copied() {
-            self.caret = target;
-            if viewport_height > 0 {
-                let center = viewport_height / 2;
-                self.vertical_scroll = self.caret.line.saturating_sub(center);
-            }
+            self.jump_caret_centered(target, viewport_height);
             true
         } else {
             false
@@ -522,38 +528,39 @@ impl App {
                 return;
             };
 
-            // Range is the stable identity for saved comments.
-            let (target, draft) =
+            // The selection's own caret range, used for a new comment and as
+            // the fallback when an existing comment hasn't projected. End col
+            // is exclusive; clamp to the pane width so it never points past the
+            // rendered grid (and never wraps).
+            let (s, e) = crate::comments::normalize_range(anchor, self.caret);
+            let selection_range = (
+                s,
+                Caret {
+                    line: e.line,
+                    col: e.col.saturating_add(1).min(self.width),
+                },
+            );
+
+            // Range is the stable identity for saved comments: an existing
+            // comment keeps its projected range, a new one takes the selection.
+            let (target, draft, range) =
                 if let Some(i) = self.comments.iter().position(|c| c.source == source_span) {
-                    let c = &self.comments[i];
-                    (EditTarget::Existing(i), c.text.clone())
+                    self.active_comment = Some(i);
+                    let range = self
+                        .comment_projections
+                        .get(i)
+                        .and_then(ProjectedCommentAnchor::full_range)
+                        .unwrap_or(selection_range);
+                    (
+                        EditTarget::Existing(i),
+                        self.comments[i].text.clone(),
+                        range,
+                    )
                 } else {
-                    (EditTarget::New, String::new())
+                    (EditTarget::New, String::new(), selection_range)
                 };
 
             let cursor = draft.len();
-            let mut range = {
-                let (s, e) = crate::comments::normalize_range(anchor, self.caret);
-                (
-                    s,
-                    Caret {
-                        line: e.line,
-                        // End col is exclusive; clamp to the pane width so it
-                        // never points past the rendered grid (and never wraps).
-                        col: e.col.saturating_add(1).min(self.width),
-                    },
-                )
-            };
-
-            if let EditTarget::Existing(i) = target {
-                self.active_comment = Some(i);
-                if let Some(p) = self.comment_projections.get(i)
-                    && let (Some(first), Some(last)) = (p.rendered.first(), p.rendered.last())
-                {
-                    range = (first.start, last.end);
-                }
-            }
-
             self.comment_state = CommentState::Editing {
                 range,
                 draft,
@@ -564,20 +571,6 @@ impl App {
         }
     }
 
-    /// Enter Editing mode on the comment currently focused via `active_comment`.
-    /// The textbox starts populated with the existing text; the cursor is
-    /// placed at the end. No-op if nothing is focused or we're not in
-    /// Browsing.
-    pub fn start_editing_active(&mut self) {
-        if !matches!(self.comment_state, CommentState::Browsing) {
-            return;
-        }
-        let Some(idx) = self.active_comment else {
-            return;
-        };
-        self.start_editing_comment(idx, CommentModeSource::Comments);
-    }
-
     fn start_editing_comment(&mut self, idx: usize, source: CommentModeSource) {
         let Some(comment) = self.comments.get(idx) else {
             return;
@@ -586,19 +579,11 @@ impl App {
         let draft = comment.text.clone();
         let cursor = draft.len();
 
-        // Find visual range from projection
+        // Visual range from the projection (empty/missing -> origin fallback).
         let range = self
             .comment_projections
             .get(idx)
-            .and_then(|p| {
-                if p.rendered.is_empty() {
-                    None
-                } else {
-                    let first = p.rendered.first().unwrap();
-                    let last = p.rendered.last().unwrap();
-                    Some((first.start, last.end))
-                }
-            })
+            .and_then(ProjectedCommentAnchor::full_range)
             .unwrap_or((Caret::default(), Caret::default()));
 
         self.comment_state = CommentState::Editing {
@@ -650,56 +635,60 @@ impl App {
     }
 
     pub fn save_draft(&mut self, markdown: &ComponentRoot) {
+        // `save_draft` is only meaningful while Editing; bail (without taking
+        // the state) otherwise so a stray call can't flip a live mode to Off.
         if !matches!(self.comment_state, CommentState::Editing { .. }) {
             return;
         }
-        if let CommentState::Editing {
+        let CommentState::Editing {
             target,
             draft,
             source,
             range,
             ..
         } = std::mem::take(&mut self.comment_state)
-        {
-            let draft_is_empty = draft.trim().is_empty();
-            match target {
-                EditTarget::New => {
-                    // Discard an empty draft instead of persisting a blank comment
-                    // that can never be removed (there is no separate delete path).
-                    if !draft_is_empty
-                        && let Some(source_span) =
-                            markdown.resolve_selection_to_source(range.0, range.1)
-                    {
-                        let selected_text = self
-                            .raw_source
-                            .as_deref()
-                            .and_then(|raw| crate::sidemark::slice_source_span(raw, source_span));
-                        let comment = Comment {
-                            source: source_span,
-                            text: draft,
-                            selected_text,
-                        };
-                        self.comments.push(comment);
-                    }
-                    self.active_comment = None;
+        else {
+            return; // unreachable: guarded above
+        };
+
+        let draft_is_empty = draft.trim().is_empty();
+        match target {
+            EditTarget::New => {
+                // Discard an empty draft instead of persisting a blank comment
+                // that can never be removed (there is no separate delete path).
+                if !draft_is_empty
+                    && let Some(source_span) =
+                        markdown.resolve_selection_to_source(range.0, range.1)
+                {
+                    let selected_text = self
+                        .raw_source
+                        .as_deref()
+                        .and_then(|raw| crate::sidemark::slice_source_span(raw, source_span));
+                    let comment = Comment {
+                        source: source_span,
+                        text: draft,
+                        selected_text,
+                    };
+                    self.comments.push(comment);
                 }
-                EditTarget::Existing(i) => {
-                    if i < self.comments.len() {
-                        if draft_is_empty {
-                            // Clearing the text of an existing comment deletes it,
-                            // doubling as the delete affordance.
-                            self.comments.remove(i);
-                            self.active_comment = None;
-                        } else {
-                            self.comments[i].text = draft;
-                        }
+                self.active_comment = None;
+            }
+            EditTarget::Existing(i) => {
+                if i < self.comments.len() {
+                    if draft_is_empty {
+                        // Clearing the text of an existing comment deletes it,
+                        // doubling as the delete affordance.
+                        self.comments.remove(i);
+                        self.active_comment = None;
+                    } else {
+                        self.comments[i].text = draft;
                     }
                 }
             }
-            self.comment_projections = markdown.project_comments(&self.comments);
-            self.comment_state = source.restored_state();
-            self.restore_scroll_mode_if_auto_entered();
         }
+        self.comment_projections = markdown.project_comments(&self.comments);
+        self.comment_state = source.restored_state();
+        self.restore_scroll_mode_if_auto_entered();
     }
 
     pub fn cancel_editing(&mut self) {
@@ -757,9 +746,7 @@ impl App {
             && let Some(projection) = self.comment_projections.get(idx)
             && let Some(first_range) = projection.rendered.first()
         {
-            self.caret = first_range.start;
-            let center = viewport_height / 2;
-            self.vertical_scroll = self.caret.line.saturating_sub(center);
+            self.jump_caret_centered(first_range.start, viewport_height);
         }
     }
 
@@ -819,6 +806,13 @@ impl<'a> From<&'a str> for LinkType<'a> {
     fn from(s: &'a str) -> Self {
         if s.starts_with('#') {
             return Self::Internal { heading: s };
+        }
+
+        // A URL with an explicit scheme (http://, https://, mailto:, …) is
+        // always external, even when its path ends in `.md` — otherwise
+        // `https://example.com/page.md` would be mangled into a local file.
+        if s.contains("://") || s.starts_with("mailto:") {
+            return Self::External(s);
         }
 
         if s.ends_with(".md") || !s.contains('.') || s.contains(".md#") {
@@ -926,10 +920,10 @@ pub(crate) mod test_utils {
         if col > 0 {
             words.push(Word::new(" ".repeat(col as usize), WordType::Normal));
         }
-        words.push(Word::new_source(
+        words.push(Word::new_with_source_span(
             " ".repeat(len as usize),
             WordType::Normal,
-            span,
+            Some(span),
         ));
         let mut comp = TextComponent::new(TextNode::Paragraph, words);
         comp.set_y_offset(line);
@@ -937,6 +931,23 @@ pub(crate) mod test_utils {
             None,
             vec![crate::nodes::root::Component::TextComponent(comp)],
         )
+    }
+
+    /// A document `rows` lines tall (one component), for scroll-clamp tests.
+    pub fn tall_markdown(rows: u16) -> ComponentRoot {
+        let content: Vec<Vec<Word>> = (0..rows)
+            .map(|_| vec![Word::new("x".to_owned(), WordType::Normal)])
+            .collect();
+        let comp = TextComponent::new_formatted(TextNode::Paragraph, content);
+        ComponentRoot::new(
+            None,
+            vec![crate::nodes::root::Component::TextComponent(comp)],
+        )
+    }
+
+    /// A parsed document containing a single link.
+    pub fn markdown_with_link() -> ComponentRoot {
+        crate::parser::parse_markdown(None, "[text](https://example.com)", 40)
     }
 
     pub fn push_comment(app: &mut App, line: u16, col: u16, len: u16, text: &str) {
@@ -975,6 +986,88 @@ mod tests {
     use super::*;
     use crate::comments::{CommentModeSource, RenderedRange};
     use test_utils::*;
+
+    #[test]
+    fn link_type_classifies_schemes_paths_and_anchors() {
+        // Scheme'd URLs are external even when the path ends in `.md`.
+        assert!(matches!(
+            LinkType::from("https://example.com/page.md"),
+            LinkType::External("https://example.com/page.md")
+        ));
+        assert!(matches!(
+            LinkType::from("http://example.com"),
+            LinkType::External(_)
+        ));
+        assert!(matches!(
+            LinkType::from("mailto:a@b.com"),
+            LinkType::External(_)
+        ));
+
+        // In-page anchors are internal.
+        assert!(matches!(
+            LinkType::from("#heading"),
+            LinkType::Internal {
+                heading: "#heading"
+            }
+        ));
+
+        // Local markdown files (with/without extension, with anchor).
+        assert!(matches!(
+            LinkType::from("notes.md"),
+            LinkType::MarkdownFile { path, heading: None } if path == "notes.md"
+        ));
+        assert!(matches!(
+            LinkType::from("notes.md#intro"),
+            LinkType::MarkdownFile { path, heading: Some(h) } if path == "notes.md" && h == "intro"
+        ));
+    }
+
+    #[test]
+    fn scroll_to_top_and_up_floor_at_zero() {
+        let mut app = app_with_width(40);
+        app.vertical_scroll = 50;
+        app.scroll(ScrollAction::ToTop, &mut tall_markdown(100), 10);
+        assert_eq!(app.vertical_scroll, 0);
+        // Scrolling up from the top stays at 0 (saturating).
+        app.scroll(ScrollAction::Up, &mut tall_markdown(100), 10);
+        assert_eq!(app.vertical_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_half_page_and_page_up_subtract_without_underflow() {
+        let mut app = app_with_width(40);
+        app.vertical_scroll = 10;
+        app.scroll(ScrollAction::HalfPageUp, &mut tall_markdown(100), 10);
+        assert_eq!(app.vertical_scroll, 5); // 10 - 10/2
+        app.scroll(ScrollAction::PageUp, &mut tall_markdown(100), 8);
+        assert_eq!(app.vertical_scroll, 0); // 5 - 8 saturates to 0
+    }
+
+    #[test]
+    fn scroll_down_and_to_bottom_clamp_to_document_height() {
+        // height 30, viewport 10: clamp ceiling is 30 - 10/2 = 25.
+        let mut app = app_with_width(40);
+        app.scroll(ScrollAction::Down, &mut tall_markdown(30), 10);
+        assert_eq!(app.vertical_scroll, 1);
+        app.scroll(ScrollAction::ToBottom, &mut tall_markdown(30), 10);
+        assert_eq!(app.vertical_scroll, 25);
+    }
+
+    #[test]
+    fn select_top_link_errors_when_document_has_no_links() {
+        let mut app = app_with_width(40);
+        app.select_top_link(&mut mock_markdown(), 10);
+        assert!(!app.selected);
+        assert_eq!(app.boxes, Boxes::Error);
+    }
+
+    #[test]
+    fn select_top_link_marks_selected_when_a_link_exists() {
+        let mut app = app_with_width(40);
+        app.select_top_link(&mut markdown_with_link(), 10);
+        assert!(app.selected);
+        assert_ne!(app.boxes, Boxes::Error);
+    }
 
     #[test]
     fn test_jump_history() {
@@ -1715,14 +1808,14 @@ mod tests {
     }
 
     #[test]
-    fn start_editing_active_loads_existing_text_at_end() {
+    fn start_editing_active_or_caret_loads_existing_text_at_end() {
         use crate::comments::{CommentModeSource, CommentState, EditTarget};
         let mut app = app_with_width(40);
         app.caret_mode = true;
         app.comment_state = CommentState::Browsing;
         push_comment(&mut app, 2, 4, 5, "hello");
         app.active_comment = Some(0);
-        app.start_editing_active();
+        assert!(app.start_editing_active_or_caret());
         match &app.comment_state {
             CommentState::Editing {
                 range,
@@ -1745,13 +1838,13 @@ mod tests {
     }
 
     #[test]
-    fn start_editing_active_no_op_without_active() {
+    fn start_editing_active_or_caret_no_op_without_active_or_caret_match() {
         use crate::comments::CommentState;
         let mut app = app_with_width(40);
         app.caret_mode = true;
         app.comment_state = CommentState::Browsing;
         app.active_comment = None;
-        app.start_editing_active();
+        assert!(!app.start_editing_active_or_caret());
         assert_eq!(app.comment_state, CommentState::Browsing);
     }
 
@@ -1959,9 +2052,11 @@ mod tests {
 
     #[test]
     fn jump_to_outline_mark_no_op_without_mark() {
-        let mut app = App::default();
-        app.caret = Caret { line: 5, col: 2 };
-        app.vertical_scroll = 5;
+        let mut app = App {
+            caret: Caret { line: 5, col: 2 },
+            vertical_scroll: 5,
+            ..App::default()
+        };
         app.jump_to_outline_mark(20);
         // No mark set → no state change.
         assert_eq!(app.caret, Caret { line: 5, col: 2 });
@@ -1971,10 +2066,12 @@ mod tests {
 
     #[test]
     fn jump_to_outline_mark_swaps_caret_and_centers_when_off_mark_line() {
-        let mut app = App::default();
-        app.outline_mark = Some(Caret { line: 3, col: 7 });
-        app.caret = Caret { line: 100, col: 0 };
-        app.vertical_scroll = 90;
+        let mut app = App {
+            outline_mark: Some(Caret { line: 3, col: 7 }),
+            caret: Caret { line: 100, col: 0 },
+            vertical_scroll: 90,
+            ..App::default()
+        };
         app.jump_to_outline_mark(20);
         // Caret moved to mark, viewport centered on caret line, mark stays.
         assert_eq!(app.caret, Caret { line: 3, col: 7 });
@@ -1984,10 +2081,12 @@ mod tests {
 
     #[test]
     fn jump_to_outline_mark_clears_when_already_on_mark_line() {
-        let mut app = App::default();
-        app.outline_mark = Some(Caret { line: 3, col: 7 });
-        app.caret = Caret { line: 3, col: 0 }; // same line, different col
-        app.vertical_scroll = 5;
+        let mut app = App {
+            outline_mark: Some(Caret { line: 3, col: 7 }),
+            caret: Caret { line: 3, col: 0 }, // same line, different col
+            vertical_scroll: 5,
+            ..App::default()
+        };
         app.jump_to_outline_mark(20);
         // Caret already on mark.line → mark cleared, no caret/scroll change.
         assert!(app.outline_mark.is_none());
@@ -1997,10 +2096,12 @@ mod tests {
 
     #[test]
     fn jump_to_outline_mark_double_press_swap_then_clear() {
-        let mut app = App::default();
-        app.outline_mark = Some(Caret { line: 2, col: 0 });
-        app.caret = Caret { line: 50, col: 0 };
-        app.vertical_scroll = 40;
+        let mut app = App {
+            outline_mark: Some(Caret { line: 2, col: 0 }),
+            caret: Caret { line: 50, col: 0 },
+            vertical_scroll: 40,
+            ..App::default()
+        };
         app.jump_to_outline_mark(20);
         assert_eq!(app.caret.line, 2);
         assert!(app.outline_mark.is_some());
@@ -2011,15 +2112,17 @@ mod tests {
 
     #[test]
     fn save_draft_restores_scroll_when_auto_entered() {
-        let mut app = App::default();
-        app.caret_mode = true;
-        app.auto_caret_for_comment_edit = true;
-        app.comment_state = CommentState::Editing {
-            range: (Caret { line: 0, col: 0 }, Caret { line: 0, col: 1 }),
-            draft: String::new(),
-            cursor: 0,
-            target: EditTarget::New,
-            source: CommentModeSource::Caret,
+        let mut app = App {
+            caret_mode: true,
+            auto_caret_for_comment_edit: true,
+            comment_state: CommentState::Editing {
+                range: (Caret { line: 0, col: 0 }, Caret { line: 0, col: 1 }),
+                draft: String::new(),
+                cursor: 0,
+                target: EditTarget::New,
+                source: CommentModeSource::Caret,
+            },
+            ..App::default()
         };
         app.save_draft(&mock_markdown());
         assert!(!app.caret_mode, "auto-entered caret mode should flip back");
@@ -2029,15 +2132,17 @@ mod tests {
 
     #[test]
     fn save_draft_keeps_caret_mode_when_not_auto_entered() {
-        let mut app = App::default();
-        app.caret_mode = true;
-        app.auto_caret_for_comment_edit = false;
-        app.comment_state = CommentState::Editing {
-            range: (Caret { line: 0, col: 0 }, Caret { line: 0, col: 1 }),
-            draft: String::new(),
-            cursor: 0,
-            target: EditTarget::New,
-            source: CommentModeSource::Caret,
+        let mut app = App {
+            caret_mode: true,
+            auto_caret_for_comment_edit: false,
+            comment_state: CommentState::Editing {
+                range: (Caret { line: 0, col: 0 }, Caret { line: 0, col: 1 }),
+                draft: String::new(),
+                cursor: 0,
+                target: EditTarget::New,
+                source: CommentModeSource::Caret,
+            },
+            ..App::default()
         };
         app.save_draft(&mock_markdown());
         assert!(
@@ -2048,15 +2153,17 @@ mod tests {
 
     #[test]
     fn cancel_editing_restores_scroll_when_auto_entered() {
-        let mut app = App::default();
-        app.caret_mode = true;
-        app.auto_caret_for_comment_edit = true;
-        app.comment_state = CommentState::Editing {
-            range: (Caret { line: 0, col: 0 }, Caret { line: 0, col: 1 }),
-            draft: "abc".into(),
-            cursor: 3,
-            target: EditTarget::New,
-            source: CommentModeSource::Caret,
+        let mut app = App {
+            caret_mode: true,
+            auto_caret_for_comment_edit: true,
+            comment_state: CommentState::Editing {
+                range: (Caret { line: 0, col: 0 }, Caret { line: 0, col: 1 }),
+                draft: "abc".into(),
+                cursor: 3,
+                target: EditTarget::New,
+                source: CommentModeSource::Caret,
+            },
+            ..App::default()
         };
         app.cancel_editing();
         assert!(!app.caret_mode);
@@ -2065,9 +2172,11 @@ mod tests {
 
     #[test]
     fn manual_toggle_caret_mode_clears_auto_flag() {
-        let mut app = App::default();
-        app.caret_mode = true;
-        app.auto_caret_for_comment_edit = true;
+        let mut app = App {
+            caret_mode: true,
+            auto_caret_for_comment_edit: true,
+            ..App::default()
+        };
         app.toggle_caret_mode(20);
         assert!(!app.caret_mode);
         assert!(

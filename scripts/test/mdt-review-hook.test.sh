@@ -143,12 +143,36 @@ case $out3 in
     *) no "format_reason: collapses newline in body to one bullet line"; printf '       got: %q\n' "$out3" ;;
 esac
 
+# A literal TAB inside a scalar must not scramble the awk column split: the
+# `line`/`text`/`sel` columns stay intact and the tab is squashed to a space.
+tab_dump=$(mktemp -t mdt-tab.XXXXXX)
+printf 'comments:\n  - id: x\n    text: "a\tb"\n    line: 7\n    selected_text: "c\td"\n' >"$tab_dump"
+out_tab=$(format_reason "$tab_dump")
+rm -f -- "$tab_dump"
+case $out_tab in
+    *'- L7: a b  (on: c d)'*) ok "format_reason: literal tab in field does not scramble columns" ;;
+    *) no "format_reason: literal tab in field does not scramble columns"; printf '       got: %q\n' "$out_tab" ;;
+esac
+
 # --- emit_context -------------------------------------------------------
 emitted=$(emit_context $'do the thing\nand the other')
 check "emit_context: hookEventName is PostToolUse" "PostToolUse" \
     "$(printf '%s' "$emitted" | jq -r .hookSpecificOutput.hookEventName)"
 check "emit_context: additionalContext preserves newlines" $'do the thing\nand the other' \
     "$(printf '%s' "$emitted" | jq -r .hookSpecificOutput.additionalContext)"
+
+# Adversarial comment text (quotes, backslashes, command substitution, braces)
+# must produce *valid* JSON and round-trip unchanged — never break out of the
+# string or inject structure.
+adv=$'he said "hi"\\ then `whoami` $(id) {"k":"v"} \n\t end'
+adv_emitted=$(emit_context "$adv")
+if printf '%s' "$adv_emitted" | jq -e . >/dev/null 2>&1; then
+    ok "emit_context: adversarial text -> valid JSON"
+else
+    no "emit_context: adversarial text -> valid JSON"; printf '       got: %q\n' "$adv_emitted"
+fi
+check "emit_context: adversarial text round-trips unchanged" "$adv" \
+    "$(printf '%s' "$adv_emitted" | jq -r .hookSpecificOutput.additionalContext)"
 
 # --- shared popup lib ---------------------------------------------------
 . "$ROOT/scripts/lib/mdt-popup-lib.sh"
