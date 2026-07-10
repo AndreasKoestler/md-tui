@@ -297,7 +297,12 @@ fn parse_component(parse_node: ParseNode) -> Component {
 
             for node in leaf_nodes {
                 let word_type = WordType::from(node.kind());
-                let mut content = node.content().to_owned();
+                let mut content = node
+                    .content()
+                    .to_owned()
+                    .chars()
+                    .dedup_by(|x, y| *x == ' ' && *y == ' ')
+                    .collect::<String>();
 
                 if matches!(node.kind(), MdParseEnum::WikiLink | MdParseEnum::InlineLink) {
                     let comp = Word::new(content.clone(), WordType::LinkData);
@@ -311,9 +316,16 @@ fn parse_component(parse_node: ParseNode) -> Component {
                 }
                 words.push(Word::new(content, word_type));
             }
-            if let Some(w) = words.first_mut() {
+
+            if let Some(w) = words
+                .iter_mut()
+                .filter(|f| f.kind() == WordType::Normal)
+                .nth(1)
+                && indent > 1
+            {
                 w.set_content(w.content().trim_start().to_owned());
             }
+
             Component::TextComponent(TextComponent::new(TextNode::Heading, words))
         }
 
@@ -798,7 +810,6 @@ mod tests {
         assert!(!kinds.is_empty());
     }
 
-
     fn has_details_summary(kinds: &[TextNode]) -> bool {
         kinds
             .iter()
@@ -1085,6 +1096,102 @@ mod tests {
         assert!(
             lb.is_hidden(),
             "LineBreak inside a folded details body should be hidden"
+        );
+    }
+
+    #[test]
+    fn inline_code_in_heading_parses_as_single_heading() {
+        // Backtick code spans inside headings must not be split into a separate
+        // Paragraph component — the whole line should be one Heading node.
+        let md = "## Title — `Code in title`\n";
+        let kinds = component_kinds(md);
+        let heading_count = kinds.iter().filter(|k| **k == TextNode::Heading).count();
+        let paragraph_count = kinds.iter().filter(|k| **k == TextNode::Paragraph).count();
+        assert_eq!(
+            heading_count, 1,
+            "expected exactly one Heading, got {kinds:?}"
+        );
+        assert_eq!(
+            paragraph_count, 0,
+            "inline code must not spill into a Paragraph, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn inline_code_in_heading_contains_code_word() {
+        let md = "## Service — `MyService`\n";
+        let root = parse_markdown(None, md, 80);
+        let comps = root.components();
+        let heading = comps
+            .iter()
+            .find(|c| c.kind() == TextNode::Heading)
+            .expect("no Heading found");
+        let has_code_word = heading
+            .content()
+            .iter()
+            .flatten()
+            .any(|w| w.kind() == WordType::Code);
+        assert!(
+            has_code_word,
+            "heading content should contain a Code word, got {:?}",
+            heading.content()
+        );
+    }
+
+    #[test]
+    fn inline_code_on_line_after_heading_stays_separate() {
+        // A heading must not swallow a following line that begins with an inline
+        // code span: `code`'s leading optional NEWLINE must not leak across the
+        // heading boundary.
+        let md = "# Heading\n`foo` bar\n";
+        let kinds = component_kinds(md);
+        let heading_count = kinds.iter().filter(|k| **k == TextNode::Heading).count();
+        let paragraph_count = kinds.iter().filter(|k| **k == TextNode::Paragraph).count();
+        assert_eq!(
+            heading_count, 1,
+            "expected exactly one Heading, got {kinds:?}"
+        );
+        assert_eq!(
+            paragraph_count, 1,
+            "code line after heading must be its own Paragraph, got {kinds:?}"
+        );
+    }
+    fn heading_text(md: &str) -> String {
+        let root = parse_markdown(None, md, 80);
+        let comps = root.components();
+        comps
+            .iter()
+            .find(|c| c.kind() == TextNode::Heading)
+            .expect("no Heading found")
+            .content()
+            .iter()
+            .flatten()
+            .filter(|w| !matches!(w.kind(), WordType::MetaInfo(_)))
+            .map(|w| w.content())
+            .collect()
+    }
+
+    #[test]
+    fn inline_code_in_heading_keeps_surrounding_spaces() {
+        // A code span in a heading must keep the separating space to following
+        // text instead of gluing onto it.
+        assert_eq!(heading_text("## Title `Code` more\n"), "## Title Code more");
+        // Leading code span keeps the space to following text.
+        assert_eq!(heading_text("# `Lead` rest\n"), "Lead rest");
+        // Multiple code spans all stay spaced.
+        assert_eq!(heading_text("## a `b` c `d` e\n"), "## a b c d e");
+        // Code-only heading is unaffected.
+        assert_eq!(heading_text("# `OnlyCode`\n"), "OnlyCode");
+        // No source space between code and text stays glued.
+        assert_eq!(heading_text("## word `code`tight\n"), "## word codetight");
+    }
+
+    #[test]
+    fn heading_plain_text_unchanged() {
+        assert_eq!(heading_text("# Plain heading\n"), "Plain heading");
+        assert_eq!(
+            heading_text("##    Many   spaces   here\n"),
+            "## Many spaces here"
         );
     }
 }
